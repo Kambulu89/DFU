@@ -21,12 +21,12 @@ Este diretório é de investigação e é independente da plataforma de gestão 
 
 ## Como correr no Kaggle
 
-1. Crie um *Dataset* com a pasta `DFUTissue` de <https://github.com/uwm-bigdata/DFUTissueSegNet> (contém `Labeled/` e `Unlabeled/`) e adicione-o ao notebook.
+1. Forma mais simples: ative **Settings > Internet** — o notebook clona sozinho os dados de <https://github.com/uwm-bigdata/DFUTissueSegNet>. Alternativa (Internet desligada): crie um *Dataset* com a pasta `DFUTissue` (contém `Labeled/` e `Unlabeled/`) e adicione-o ao notebook.
 2. Ative a GPU (T4/P100). Com **Internet ligada**, o notebook instala `segmentation-models-pytorch` e descarrega pesos pré-treinados. Com **Internet desligada**, adicione
    datasets com o *wheel* de `segmentation_models_pytorch` e com os pesos (ficheiros `.pth/.pt/.bin/.safetensors` cujo nome/pasta contenha `efficientnet_b4`,
    `convnext_small` ou `mit_b3`). Sem pesos, treina-se com inicialização aleatória e isso fica registado (`weights_provenance.json`) — não é *transfer learning*.
 3. Na célula de configuração escolha `MODE`: `quick` (primeira corrida, 2 arquiteturas × 1 semente) ou `full` (3 arquiteturas × 3 sementes, sondas, ablação, SSL em 2 rondas).
-   Variáveis opcionais: `DFU_MODE`, `DFU_DATA_ROOT`, `DFU_ALLOW_DOWNLOAD=1` (clona o repositório se houver Internet), `DFU_CFG_OVERRIDE` (JSON).
+   Variáveis opcionais: `DFU_MODE`, `DFU_DATA_ROOT`, `DFU_ALLOW_DOWNLOAD=0` (desliga o clone automático do repositório dos autores, que por omissão ocorre se não houver dataset anexado e a Internet estiver ligada), `DFU_CFG_OVERRIDE` (JSON).
 4. Execute tudo. As execuções são idempotentes (`runs/*/result.json`): se a sessão cair, volte a correr e o que já terminou é reutilizado (treinos longos retomam de `last.pt`).
 
 ## Decisões metodológicas que afetam a comparação com o artigo

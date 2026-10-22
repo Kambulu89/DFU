@@ -1,51 +1,79 @@
 # %% [markdown]
 # ## 6. Localização e auditoria do dataset
 #
-# O notebook procura em `/kaggle/input` (ou em `DFU_DATA_ROOT`) uma pasta que contenha `Labeled/labeled_train_names.txt`
-# (estrutura do repositório oficial: `Labeled/{Original,Padded}/{Images,Annotations,Palette}/{TrainVal,Test}`, `Labeled/*_names.txt`
-# e `Unlabeled/`). **Não inventa dados**: se não os encontrar, para com instruções.
+# O notebook procura em `/kaggle/input` (ou em `DFU_DATA_ROOT`) o ficheiro `labeled_train_names.txt` (estrutura do repositório oficial:
+# `Labeled/{Original,Padded}/{Images,Annotations,Palette}/{TrainVal,Test}`, `Labeled/*_names.txt` e `Unlabeled/`). Se não houver dataset anexado e a
+# **Internet estiver ligada**, clona o repositório público dos autores (~70 MB) para `/kaggle/working`. **Não inventa dados**: se nada funcionar,
+# mostra o conteúdo de `/kaggle/input` e para com instruções.
 #
 # Verificações: contagens, correspondência imagem↔máscara, ficheiros corrompidos, valores únicos e codificação das máscaras
 # (indexadas `P`, cinzentos `L` ou RGB — **não se assume** um formato), tamanhos, equivalência *Padded* ≙ *Original*,
 # distribuição de píxeis, duplicados exatos e quase-duplicados (*dHash*) dentro e **entre** divisões, e entre os 600 não anotados e val/teste.
 
 # %%
-ALLOW_GIT_DOWNLOAD = os.environ.get("DFU_ALLOW_DOWNLOAD", "0") == "1"  # opt-in; só com Internet ligada
+ALLOW_GIT_DOWNLOAD = os.environ.get("DFU_ALLOW_DOWNLOAD", "1") == "1"  # com Internet, clona o repositório público dos autores se não houver dataset anexado
 DATA_HELP = """
-Dataset DFUTissue não encontrado. Passos para o adicionar ao Kaggle:
-  1. Obtenha a pasta 'DFUTissue' de https://github.com/uwm-bigdata/DFUTissueSegNet (contém Labeled/ e Unlabeled/).
-  2. Kaggle > Datasets > New Dataset > carregue a pasta (mantenha a estrutura Labeled/ e Unlabeled/).
-  3. No notebook: Add Input > o seu dataset. Em alternativa defina DFU_DATA_ROOT ou DFU_ALLOW_DOWNLOAD=1 (requer Internet).
+Dataset DFUTissue não encontrado e não foi possível descarregá-lo. Duas opções no Kaggle:
+  A) (mais simples) Settings > Internet > ON e volte a executar esta célula: o notebook clona https://github.com/uwm-bigdata/DFUTissueSegNet.
+  B) Kaggle > Datasets > New Dataset > carregue a pasta 'DFUTissue' do repositório (com Labeled/ e Unlabeled/); depois Add Input > o seu dataset.
+     Se o dataset tiver outra estrutura, defina DFU_DATA_ROOT para a pasta que contém 'labeled_train_names.txt' (ou o pai dela).
 """
 
 
-def find_dataset_root() -> Path | None:
+def list_input_tree(base: Path, depth: int = 2, limit: int = 40) -> None:
+    print(f"Conteúdo de {base} (até {depth} níveis):")
+    shown = 0
+    if not base.exists():
+        print("  (não existe)")
+        return
+    d0 = len(base.parts)
+    for dp, dn, fn in os.walk(base):
+        lvl = len(Path(dp).parts) - d0
+        if lvl >= depth:
+            dn[:] = []
+        print("  " + "  " * lvl + (Path(dp).name or str(base)) + "/", f"({len(fn)} ficheiros)" if fn else "")
+        shown += 1
+        if shown >= limit:
+            print("  ...")
+            break
+
+
+def find_labeled_dir() -> Path | None:
+    """Procura a pasta que contém `labeled_train_names.txt` (normalmente 'Labeled/'), mesmo que tenha sido renomeada."""
     explicit = os.environ.get("DFU_DATA_ROOT")
-    bases = [Path(explicit)] if explicit else [INPUT_ROOT]
+    bases = [Path(explicit)] if explicit else [INPUT_ROOT, WORK]
     for base in bases:
         if not base.exists():
             continue
         depth0 = len(base.parts)
         for dirpath, dirnames, filenames in os.walk(base):
-            if len(Path(dirpath).parts) - depth0 > 6:
+            if len(Path(dirpath).parts) - depth0 > 7:
                 dirnames[:] = []
                 continue
-            if "labeled_train_names.txt" in filenames and Path(dirpath).name == "Labeled":
-                return Path(dirpath).parent
+            if "labeled_train_names.txt" in filenames:
+                return Path(dirpath)
     return None
 
 
-DATA_ROOT = find_dataset_root()
-if DATA_ROOT is None and ALLOW_GIT_DOWNLOAD and INTERNET:
+LAB_DIR = find_labeled_dir()
+if LAB_DIR is None and ALLOW_GIT_DOWNLOAD and INTERNET:
     dst = WORK / "DFUTissueSegNet"
-    if not dst.exists():
-        subprocess.run(["git", "clone", "--depth", "1", "https://github.com/uwm-bigdata/DFUTissueSegNet.git", str(dst)], check=True)
-    DATA_ROOT = dst / "DFUTissue"
-if DATA_ROOT is None:
+    print("Dataset não anexado: a clonar https://github.com/uwm-bigdata/DFUTissueSegNet (requer Internet; ~70 MB)...")
+    try:
+        if not dst.exists():
+            subprocess.run(["git", "clone", "--depth", "1", "https://github.com/uwm-bigdata/DFUTissueSegNet.git", str(dst)], check=True)
+        hit = next(iter(dst.rglob("labeled_train_names.txt")), None)
+        LAB_DIR = hit.parent if hit else None
+    except (subprocess.CalledProcessError, OSError) as e:
+        print("Falha ao clonar:", e)
+        LAB_DIR = None
+if LAB_DIR is None:
+    list_input_tree(INPUT_ROOT)
+    print(f"Internet disponível: {INTERNET} | download automático permitido: {ALLOW_GIT_DOWNLOAD}")
     raise RuntimeError(DATA_HELP)
-LAB_DIR = DATA_ROOT / "Labeled"
+DATA_ROOT = LAB_DIR.parent
 UNL_DIR = DATA_ROOT / "Unlabeled" if (DATA_ROOT / "Unlabeled").exists() else None
-print("DATA_ROOT:", DATA_ROOT, "| Unlabeled:", "sim" if UNL_DIR else "NÃO (SSL será omitido)")
+print("DATA_ROOT:", DATA_ROOT, "| Labeled:", LAB_DIR.name, "| Unlabeled:", "sim" if UNL_DIR else "NÃO (SSL será omitido)")
 
 
 def read_names(fname: str) -> list[str]:
