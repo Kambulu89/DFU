@@ -194,12 +194,18 @@ display(pd.DataFrame(cls_rows))
 # Veredicto calculado (nunca pré-preenchido)
 fm, fci = TEST_ROWS[FINAL_LABEL]["metrics"], TEST_ROWS[FINAL_LABEL]["ci"]
 verdict_rows = []
-for key, ref, nm in [("paper_dice", 0.8764, "Dice global (protocolo-réplica) vs SSL do artigo 87,64"), ("paper_dice_fibrin", 0.6901, "Dice Fibrin (conv. artigo) vs 69,01"),
-                     ("paper_dice_granulation", 0.9411, "Dice Granulation (conv. artigo) vs 94,11"), ("paper_dice_callus", 0.7827, "Dice Callus (conv. artigo) vs 78,27")]:
+for key, ref, nm in [("paper_dice", 0.8764, "Dice global (protocolo-réplica) vs SSL do artigo 87,64"),
+                     ("dice_fibrin", 0.6901, "Dice Fibrin (agregado padrão) vs 69,01"), ("dice_granulation", 0.9411, "Dice Granulation (agregado padrão) vs 94,11"),
+                     ("dice_callus", 0.7827, "Dice Callus (agregado padrão) vs 78,27"),
+                     ("paper_dice_fibrin", 0.6901, "[réplica por classe, ver nota] Fibrin vs 69,01"), ("paper_dice_granulation", 0.9411, "[réplica por classe, ver nota] Granulation vs 94,11"),
+                     ("paper_dice_callus", 0.7827, "[réplica por classe, ver nota] Callus vs 78,27")]:
     v, lo, hi = fm[key], *fci[key]
     verdict_rows.append(dict(comparação=nm, nosso=round(100 * v, 2), IC95=f"[{100 * lo:.1f}, {100 * hi:.1f}]", artigo=round(100 * ref, 2),
                              ponto_acima=bool(v > ref), IC_exclui_artigo=bool(lo > ref or hi < ref)))
 VERDICT = pd.DataFrame(verdict_rows)
 display(VERDICT)
+print("NOTA sobre as linhas por classe: a 'réplica por classe' herda os acumuladores não repostos do código dos autores (a classe 3 é avaliada com contagens das classes 1-2 incluídas) e dá 0 às"
+      " imagens onde a classe só aparece na predição. Numa execução real o padrão do artigo (granulação ~94) ficou muito mais próximo do Dice agregado padrão do que desta réplica, por isso"
+      " o agregado padrão é a comparação por classe mais plausível; a réplica por classe fica só por transparência.")
 print("Leitura: 'ponto_acima' compara só a estimativa pontual; só se pode falar de melhoria sólida se o IC exclui o valor do artigo (e mesmo assim"
       " a comparação depende da equivalência do protocolo e de um teste de 16 imagens, possivelmente com várias imagens do mesmo doente).")
