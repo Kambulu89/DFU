@@ -118,8 +118,8 @@ display(PER_IMG.round(3).sort_values("mean_dice").head(8))
 # isso a demonstração usa `assume_zero_padded=True` (recorta a extensão do conteúdo).
 
 # %%
-def segment_image(image, ids: list[str] | None = None, tta: str | None = None, pp: float | None = None, assume_zero_padded: bool = False, return_probs: bool = False):
-    ids, tta, pp = ids or FINAL["ids"], tta or FINAL["tta"], FINAL["pp"] if pp is None else pp
+def segment_image(image, ids: list[str] | None = None, tta: str | None = None, pp=None, assume_zero_padded: bool = False, return_probs: bool = False):
+    ids, tta, pp = ids or FINAL["members"], tta or FINAL["tta"], FINAL["pp"] if pp is None else pp
     img = read_rgb(Path(image)) if isinstance(image, (str, Path)) else np.asarray(image)
     if img.ndim == 2:
         img = np.stack([img] * 3, -1)
@@ -129,7 +129,7 @@ def segment_image(image, ids: list[str] | None = None, tta: str | None = None, p
         img = np.ascontiguousarray(img[:h, :w])
     items = EvalItems([dict(name="new", img=img, mask=None)], SIZE, labeled=False)
     probs = predict_probs([load_pool_model(i) for i in ids], items, tta)[0]
-    pred = remove_small_components(probs.argmax(0).astype(np.uint8), pp)
+    pred = probs_to_preds([probs], pp)[0]
     return (img, pred, probs) if return_probs else (img, pred)
 
 
@@ -151,18 +151,20 @@ print("Fração de píxeis por classe na imagem demo:", dict(zip(CLASS_NAMES, np
 # `models/*.pt` (estados em fp16 do candidato final) e `final_bundle.json` (como reconstruir o *ensemble*). Em Kaggle ficam em `/kaggle/working`.
 
 # %%
-(OUT / "config.json").write_text(json.dumps(dict(cfg=CFG, hw=HW, seeds=CFG["seeds"], mode=MODE, data_root=str(DATA_ROOT), split_sizes={k: len(v) for k, v in SPLIT_NAMES.items()},
+(OUT / "config.json").write_text(json.dumps(dict(cfg=CFG, hw=HW, seeds=CFG["seeds"], mode=MODE, data_root=str(DATA_ROOT), folds=fold_assignment(CFG["cv_folds"], CFG["cv_seed"]) if CFG["do_cv"] else None, split_sizes={k: len(v) for k, v in SPLIT_NAMES.items()},
                                                  n_unlabeled_used=len(UNL), n_unlabeled_excluded_dups=len(EXCLUDED_UNL)), indent=1, default=str))
 (OUT / "weights_provenance.json").write_text(json.dumps(WEIGHTS_PROVENANCE, indent=1, default=str))
 (OUT / "test_ledger.json").write_text(json.dumps(TEST_LEDGER, indent=1))
 final_members = []
-for rid in FINAL["ids"]:
+for rid in FINAL["members"]:
     dst = DIRS["models"] / f"{rid}.pt"
     shutil.copy(POOL[rid]["ckpt"], dst)
-    final_members.append(dict(file=f"models/{dst.name}", arch=POOL[rid]["arch"], kind=POOL[rid]["kind"], seed=POOL[rid]["seed"], val_macro_fg_dice=val_score(POOL[rid]["run"])))
+    final_members.append(dict(file=f"models/{dst.name}", arch=POOL[rid]["arch"], kind=POOL[rid]["kind"], seed=POOL[rid]["seed"], fold=POOL[rid]["fold"],
+                              heldout_macro_fg_dice=val_score(POOL[rid]["run"])))
 (OUT / "final_bundle.json").write_text(json.dumps(dict(
-    candidate=FINAL_NAME, members=final_members, frame=FRAME, size=SIZE, tta=FINAL["tta"], pp_min_area_frac=FINAL["pp"], classes=CLASS_NAMES, mean=IMAGENET_MEAN, std=IMAGENET_STD,
-    note="Modelos = smp.<arch>(encoder_weights=None, classes=4) envolvidos em Net (normalização ImageNet interna); state_dict em fp16 -> converter para float32 ao carregar.",
+    candidate=FINAL_NAME, members=final_members, frame=FRAME, size=SIZE, tta=FINAL["tta"], postproc=FINAL["pp"], classes=CLASS_NAMES, mean=IMAGENET_MEAN, std=IMAGENET_STD,
+    note="Modelos = smp.<arch>(encoder_weights=None, classes=4) envolvidos em Net (normalização ImageNet interna); state_dict em fp16 -> converter para float32 ao carregar. "
+         "Previsão = média uniforme das probabilidades softmax dos membros (e do TTA) -> multiplicar por postproc.scale por classe -> argmax -> remover componentes pequenas (min_frac/fibrin_frac).",
     test_metrics={k: v for k, v in FINAL_ROW["metrics"].items()}, test_ci_95={k: list(v) for k, v in FINAL_ROW["ci"].items()}), indent=1, default=float))
 pd.DataFrame([dict(label=l, **r["metrics"]) for l, r in TEST_ROWS.items()]).to_csv(DIRS["tables"] / "test_metrics_all_definitions.csv", index=False)
 all_hist = [dict(run_id=r["run_id"], **h) for r in ALL_RESULTS for h in r["history"]]
@@ -180,9 +182,13 @@ def md_table(df: pd.DataFrame) -> str:
 report = [f"# Relatório de experiências — modo `{MODE}`", "", f"* Hardware: {HW['gpu_name'] or 'CPU'} ({HW['vram_gb']} GB) | torch {HW['torch']} | smp {HW['smp']} | timm {HW['timm']}",
           f"* Frame/resolução: `{FRAME}`/{SIZE} | perda: `{CFG['loss']}` | sementes: {CFG['seeds']} | arquiteturas: {CFG['archs']}",
           f"* Pesos pré-treinados efetivos: {{{', '.join(f'{k}: {v.get('pretrained_effective')}' for k, v in WEIGHTS_PROVENANCE.items())}}}",
-          f"* Não anotadas usadas: {len(UNL)} (excluídas por quase-duplicado de val/teste: {len(EXCLUDED_UNL)})", f"* Candidato final (escolhido na validação): `{FINAL_NAME}` — {len(FINAL['ids'])} modelo(s), TTA={FINAL['tta']}, pp={FINAL['pp']}",
+          f"* Não anotadas usadas: {len(UNL)} (excluídas por quase-duplicado de val/teste: {len(EXCLUDED_UNL)})", f"* Candidato final (escolhido no conjunto de desenvolvimento, {'OOF de ' + str(len(EVAL_ITEMS)) + ' imagens' if CFG['do_cv'] else 'validação oficial'}): `{FINAL_NAME}` — {len(FINAL['members'])} modelo(s), TTA={FINAL['tta']}, pós-proc.={FINAL['pp']}",
+          f"* Ganho honesto do pós-processamento (ajuste numa metade, avaliação na outra): {100 * PP_HONEST_GAIN[0]:+.2f} pp ± {100 * PP_HONEST_GAIN[1]:.2f}",
           f"* Eventos de leitura do teste: {len(TEST_LEDGER)} (ver test_ledger.json)", "", "## Tabela comparativa (teste; % ; IC bootstrap 95 %)", "", md_table(COMPARISON),
           "", "## Veredicto calculado", "", VERDICT.to_string(index=False), "",
+          "## Desempenho de desenvolvimento das variantes supervisionadas (OOF)", "", md_table(OOF_TABLE.round(4)), "",
+          "## SSL vs supervisionado (OOF, bootstrap pareado)", "", md_table(SSL_PAIRED) if len(SSL_PAIRED) else "(sem SSL)", "",
+          "## Comparações pareadas no teste", "", md_table(TEST_PAIRED), "",
           "Aviso: os valores acima só têm valor científico se `weights_provenance.json` indicar pesos pré-treinados e se o modo não for `smoke`."]
 (OUT / "experiments_report.md").write_text("\n".join(report))
 print("Exportado em", OUT)

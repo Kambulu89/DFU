@@ -1,10 +1,17 @@
 # %% [markdown]
-# ## 14. Treino supervisionado — Experiências A e B (e sondas)
+# ## 14. Treino supervisionado — sondas e validação cruzada (Experiências A e B)
 #
-# **Regras de seleção (só validação).** Em modo `full`, antes do treino principal, duas sondas curtas com a arquitetura de referência e uma só semente:
-# (i) *frame*/resolução (`padded 256` = réplica do artigo vs `roi 256` vs `roi 384`) e (ii) função de perda. Para não sobreajustar o ruído da validação
-# (16 imagens), só se abandona a configuração por omissão se a alternativa ganhar por **mais de 0,005** de macro-Dice dos tecidos.
-# Depois treinam-se **A** (arquitetura de referência) e **B** (restantes arquiteturas) com várias sementes; o relatório mostra média ± desvio.
+# **Sondas (só validação oficial, só em `full`).** Duas sondas curtas com a arquitetura de referência e uma só semente: (i) *frame*/resolução
+# (`padded 256` = réplica do artigo vs `roi 256/384/512`) e (ii) função de perda. Só se abandona a configuração por omissão se a alternativa ganhar por
+# **mais de 0,005** de macro-Dice dos tecidos (histerese contra o ruído de 16 imagens).
+#
+# **Treino principal.**
+# * `do_cv=True` (modo `full`): **validação cruzada estratificada de `cv_folds` folds** sobre as 94 imagens de desenvolvimento (treino+validação oficiais; **o teste nunca entra**).
+#   Cada modelo treina em ~75 imagens e prevê as ~19 retidas; juntando os folds obtém-se uma previsão **fora de amostra (OOF) para as 94 imagens**, bem menos ruidosa que as 16 da
+#   validação oficial. As épocas são fixas por arquitetura (`cv_epochs`) e o modelo é o **EMA final, sem seleção de época**, para o OOF não ter viés de seleção. O *ensemble* final usa os
+#   modelos de todos os folds (portanto vê praticamente todos os dados).
+# * `do_cv=False` (`quick`/`smoke`): divisão oficial 78/16/16, com seleção por *early stopping* na validação, como antes.
+#
 # Cada execução é idempotente (reutiliza `result.json`), por isso a sessão pode ser interrompida e retomada.
 
 # %%
@@ -53,12 +60,29 @@ else:
 
 # %%
 SUP: list[dict] = []
-for seed in CFG["seeds"]:               # sementes no ciclo exterior: se o tempo acabar, todas as arquiteturas têm pelo menos a 1.ª semente
-    for arch in CFG["archs"]:
-        if not BUDGET.ok(900):
-            print("Orçamento de tempo quase esgotado: a parar novas execuções supervisionadas.")
-            break
-        SUP.append(train_run(default_spec(exp="sup", arch=arch, seed=seed)))
+if CFG["do_cv"]:
+    # assert: o teste não entra nos folds
+    _dev_names = {r["name"] for r in get_frame("roi")["train"] + get_frame("roi")["val"]}
+    assert not (_dev_names & set(SPLIT_NAMES["test"])), "Fuga: imagens de teste no conjunto de desenvolvimento"
+    _fm = fold_assignment(CFG["cv_folds"], CFG["cv_seed"])
+    print("Folds (nº de imagens / com fibrina):", {f: (sum(v == f for v in _fm.values()),
+          sum(1 for r in get_frame("roi")["train"] + get_frame("roi")["val"] if _fm[r["name"]] == f and (r["mask"] == 1).any())) for f in range(CFG["cv_folds"])})
+    # arquitetura como ciclo exterior: se o tempo acabar, as primeiras arquiteturas (as de maior prioridade) ficam com todos os folds
+    for seed in CFG["seeds"]:
+        for arch in CFG["archs"]:
+            for fold in range(CFG["cv_folds"]):
+                if not BUDGET.ok(900):
+                    print(f"Orçamento de tempo quase esgotado: a parar (último: {arch} fold {fold}).")
+                    break
+                ep = CFG["cv_epochs"].get(arch, CFG["epochs"])
+                SUP.append(train_run(default_spec(exp="cv", arch=arch, seed=seed, fold=fold, n_folds=CFG["cv_folds"], selection="last", epochs=ep, patience=ep)))
+else:
+    for seed in CFG["seeds"]:           # sementes no ciclo exterior: se o tempo acabar, todas as arquiteturas têm pelo menos a 1.ª semente
+        for arch in CFG["archs"]:
+            if not BUDGET.ok(900):
+                print("Orçamento de tempo quase esgotado: a parar novas execuções supervisionadas.")
+                break
+            SUP.append(train_run(default_spec(exp="sup", arch=arch, seed=seed)))
 ALL_RESULTS += SUP
 assert SUP, "Nenhuma execução supervisionada concluída"
 
@@ -67,7 +91,7 @@ def runs_table(results: list[dict]) -> pd.DataFrame:
     rows = []
     for r in results:
         v, s = r["val"], r["spec"]
-        rows.append(dict(exp=s["exp"], arch=s["arch"], seed=s["seed"], frame=s["frame"], size=s["size"], loss=s["loss"], pretrained=r["provenance"]["pretrained_effective"],
+        rows.append(dict(exp=s["exp"], arch=s["arch"], seed=s["seed"], fold=s.get("fold"), frame=s["frame"], size=s["size"], loss=s["loss"], pretrained=r["provenance"]["pretrained_effective"],
                          best_ep=r["best_epoch"], epochs_run=r["epochs_run"], status=r["status"], macro_fg_dice=v["macro_fg_dice"], micro_fg_dice=v["micro_fg_dice"],
                          paper_dice=v["paper_dice"], dice_fibrin=v["dice_fibrin"], dice_granulation=v["dice_granulation"], dice_callus=v["dice_callus"],
                          macro_fg_iou=v["macro_fg_iou"], minutes=round(r["train_seconds"] / 60, 1)))
@@ -76,7 +100,7 @@ def runs_table(results: list[dict]) -> pd.DataFrame:
 
 SUP_TABLE = runs_table(SUP)
 SUP_TABLE.to_csv(DIRS["tables"] / "supervised_runs_val.csv", index=False)
-print("Validação (NÃO é o teste) — execuções supervisionadas:")
+print("Validação por execução (CV: fold retido; oficial: val de 16 imagens) — NÃO é o teste:")
 display(SUP_TABLE.round(4))
 agg = SUP_TABLE.groupby("arch")[["macro_fg_dice", "micro_fg_dice", "paper_dice", "dice_fibrin", "dice_granulation", "dice_callus"]].agg(["mean", "std"]).round(4)
 display(agg)
@@ -93,7 +117,7 @@ for r in SUP:
 fig, axes = plt.subplots(len(best_by_arch), 3, figsize=(16, 3.4 * len(best_by_arch)), squeeze=False)
 for row, (arch, r) in zip(axes, best_by_arch.items()):
     h = pd.DataFrame(r["history"])
-    row[0].plot(h.epoch, h.train_loss, label="treino"); row[0].plot(h.epoch, h.val_loss, label="validação (EMA)"); row[0].set_title(f"{arch} — loss"); row[0].legend()
+    row[0].plot(h.epoch, h.train_loss, label="treino"); row[0].plot(h.epoch, h.val_loss, label="validação (EMA)"); row[0].set_title(f"{arch} (fold {r['spec'].get('fold')}) — loss"); row[0].legend()
     for c in ["macro_fg_dice", "dice_fibrin", "dice_granulation", "dice_callus"]:
         row[1].plot(h.epoch, h[f"val_{c}"], label=c.replace("val_", ""))
     row[1].set_title("Dice de validação"); row[1].legend(fontsize=7); row[1].set_ylim(0, 1)
@@ -101,30 +125,3 @@ for row, (arch, r) in zip(axes, best_by_arch.items()):
     for a in row:
         a.axvline(r["best_epoch"], color="k", ls=":", lw=0.8); a.set_xlabel("época")
 fig.tight_layout(); savefig(fig, "learning_curves_supervised.png"); plt.show()
-
-# %% [markdown]
-# ## 14b. Ablação (Experiência E) — indicativa
-# Retira-se **um** componente de cada vez à configuração de referência (mesma arquitetura, **uma só semente**, mesmo nº de épocas curto).
-# Com 16 imagens de validação e uma semente, diferenças pequenas são ruído: leia como indicação de ordem de grandeza, não como prova.
-
-# %%
-ABL = []
-if CFG["do_ablation"] and BUDGET.ok(1800):
-    variants = {"referência": {}, "sem pré-treino": dict(pretrained=False), "sem augmentation (só flips)": dict(aug="flip"),
-                "sem class-aware sampling": dict(sampler=False), "só CE (sem Dice)": dict(loss="ce"), "sem freeze inicial": dict(freeze_epochs=0)}
-    for name, ov in variants.items():
-        if not BUDGET.ok(600):
-            break
-        r = train_run(default_spec(exp="ablation:" + name, arch=REF_ARCH, epochs=CFG["ablation_epochs"], patience=CFG["ablation_epochs"], keep_ckpt=False, **ov))
-        ABL.append(r)
-    ALL_RESULTS += ABL
-    abl_df = runs_table(ABL).assign(variante=[r["spec"]["exp"].split(":", 1)[1] for r in ABL])
-    abl_df = abl_df[["variante", "macro_fg_dice", "dice_fibrin", "dice_granulation", "dice_callus", "micro_fg_dice", "paper_dice"]]
-    abl_df["delta_macro_fg_vs_ref"] = abl_df.macro_fg_dice - abl_df.macro_fg_dice.iloc[0]
-    abl_df.to_csv(DIRS["tables"] / "ablation_val.csv", index=False)
-    display(abl_df.round(4))
-    fig, ax = plt.subplots(figsize=(8, 3.2))
-    ax.barh(abl_df.variante[::-1], abl_df.macro_fg_dice[::-1]); ax.set_xlabel("macro-Dice dos tecidos (validação, 1 semente)")
-    fig.tight_layout(); savefig(fig, "ablation_val.png"); plt.show()
-else:
-    print("Ablação não executada (`do_ablation=False` ou sem orçamento de tempo). A SSL e o TTA são avaliados abaixo contra a sua própria referência.")

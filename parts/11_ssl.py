@@ -81,7 +81,7 @@ def _cycle(loader):
 def train_ssl_round(sup_run: dict, init_ckpt: str, round_idx: int, unl_recs: list[dict]) -> dict:
     """Uma ronda de EMA teacher–student a partir de `init_ckpt`. Devolve resultado com o melhor teacher (inclui o ponto inicial)."""
     spec = dict(sup_run["spec"]) | dict(exp=f"ssl_r{round_idx}", epochs=CFG["ssl_epochs"], init=init_ckpt, keep_frac=CFG["ssl_keep_frac"], tau=[CFG["ssl_tau_min"], CFG["ssl_tau_max"]],
-                lambda_u=CFG["ssl_lambda_u"], ssl_steps=CFG["ssl_steps_per_epoch"], n_unl=len(unl_recs))
+                lambda_u=CFG["ssl_lambda_u"], ssl_steps=CFG["ssl_steps_per_epoch"], n_unl=len(unl_recs), ssl_select=CFG["ssl_select"])
     rid = run_id_of(spec)
     rdir = DIRS["runs"] / rid
     rf = rdir / "result.json"
@@ -91,9 +91,9 @@ def train_ssl_round(sup_run: dict, init_ckpt: str, round_idx: int, unl_recs: lis
     rdir.mkdir(parents=True, exist_ok=True)
     seed_everything(spec["seed"] + 1000 * (round_idx + 1))
     S, bs = spec["size"], spec["batch_size"]
-    recs = get_frame(spec["frame"])
-    lab_set, unl_set = SegSet(recs["train"], S, aug="standard"), SegSet(unl_recs, S, aug="weak", labeled=False)
-    val_items = EvalItems(recs["val"], S)
+    tr_recs, va_recs = split_for(spec)
+    lab_set, unl_set = SegSet(tr_recs, S, aug="standard"), SegSet(unl_recs, S, aug="weak", labeled=False)
+    val_items = EvalItems(va_recs, S)
     nw = CFG["num_workers"]
     mk = lambda ds, sampler: torch.utils.data.DataLoader(ds, batch_size=bs, sampler=sampler, num_workers=nw, drop_last=True, worker_init_fn=worker_init,  # noqa: E731
                                                           pin_memory=DEVICE.type == "cuda", persistent_workers=nw > 0)
@@ -107,7 +107,7 @@ def train_ssl_round(sup_run: dict, init_ckpt: str, round_idx: int, unl_recs: lis
     student.to(DEVICE)
     teacher = EMA(student, 0.99)
     micro = max(1, probe_micro_batch(student, S, bs) // 2)
-    crit = SegLoss(spec["loss"], class_weights_from(recs["train"], CFG["class_weight_cap"]), CFG["label_smoothing"]).to(DEVICE)
+    crit = SegLoss(spec["loss"], class_weights_from(tr_recs, CFG["class_weight_cap"]), CFG["label_smoothing"]).to(DEVICE)
     lr_mult = 0.25
     opt = torch.optim.AdamW([{"params": student.encoder_params(), "lr": spec["lr_encoder"] * lr_mult}, {"params": student.other_params(), "lr": spec["lr_decoder"] * lr_mult}],
                             weight_decay=CFG["weight_decay"])
@@ -120,7 +120,7 @@ def train_ssl_round(sup_run: dict, init_ckpt: str, round_idx: int, unl_recs: lis
     base_score = base["macro_fg_dice"]
     best, best_ep, bad = base_score, -1, 0
     shutil.copy(init_ckpt, rdir / "best.pt")
-    hist, t0 = [], time.time()
+    hist, t0, last_score = [], time.time(), base_score
     acc = dict(lsup=0.0, lunl=0.0, n=0, kept=np.zeros(K), seen=np.zeros(K), valid_frac=0.0)
     step = 0
     for epoch in range(spec["epochs"]):
@@ -167,20 +167,25 @@ def train_ssl_round(sup_run: dict, init_ckpt: str, round_idx: int, unl_recs: lis
                          **{f"kept_{CLASS_NAMES[c].lower()}": float(acc["kept"][c] / max(acc["seen"][c], 1)) for c in range(K)},
                          **{f"share_{CLASS_NAMES[c].lower()}": float(acc["seen"][c] / max(acc["seen"].sum(), 1)) for c in range(K)}))
         acc = dict(lsup=0.0, lunl=0.0, n=0, kept=np.zeros(K), seen=np.zeros(K), valid_frac=0.0)
-        if score > best + 1e-4:
-            best, best_ep, bad = score, epoch, 0
-            _save_half(teacher.module.state_dict(), rdir / "best.pt")
-        else:
-            bad += 1
+        last_score = score
+        if spec["ssl_select"] == "best":
+            if score > best + 1e-4:
+                best, best_ep, bad = score, epoch, 0
+                _save_half(teacher.module.state_dict(), rdir / "best.pt")
+            else:
+                bad += 1
         if epoch % max(1, spec["epochs"] // 8) == 0 or epoch == spec["epochs"] - 1:
             print(f"  {rid} ep{epoch:03d} Lsup {hist[-1]['loss_sup']:.3f} Lunl {hist[-1]['loss_unl']:.3f} val {score:.4f} (base {base_score:.4f}, best {best:.4f}@{best_ep})")
-        if bad >= max(8, spec["epochs"] // 3):
+        if spec["ssl_select"] == "best" and bad >= max(8, spec["epochs"] // 3):
             break
+    if spec["ssl_select"] == "last":      # sem seleção de época: o modelo é o teacher EMA final (avaliação não enviesada)
+        _save_half(teacher.module.state_dict(), rdir / "best.pt")
+        best, best_ep = last_score if hist else base_score, len(hist) - 1
 
     final = Net(ARCH_SPECS[spec["arch"]]["ctor"](None)).to(DEVICE)
     final.load_state_dict(_load_half(rdir / "best.pt"))
     vfin = evaluate_models([final], val_items, "none")[0].metrics()
-    result = dict(spec=spec, run_id=rid, status="finished", best_epoch=best_ep, epochs_run=len(hist), val=vfin, val_before=base, improved=best > base_score + 1e-4, history=hist,
+    result = dict(spec=spec, run_id=rid, status="finished", best_epoch=best_ep, epochs_run=len(hist), val=vfin, val_names=[r["name"] for r in va_recs], val_before=base, improved=best > base_score + 1e-4, history=hist,
                   provenance=prov, params_M=round(count_params(student), 2), micro_batch=micro, train_seconds=round(time.time() - t0, 1), ckpt=str(rdir / "best.pt"),
                   device=HW["gpu_name"] or "cpu")
     rf.write_text(json.dumps(result, indent=1, default=float))
@@ -191,27 +196,29 @@ def train_ssl_round(sup_run: dict, init_ckpt: str, round_idx: int, unl_recs: lis
 
 
 SSL_RESULTS: list[dict] = []
-SSL_FINAL: dict[str, dict] = {}   # id da execução supervisionada -> melhor resultado SSL (ou o supervisionado se não houve ganho)
 if CFG["do_ssl"] and len(UNL) > 0 and BUDGET.ok(1800):
-    arch_mean = SUP_TABLE.groupby("arch").macro_fg_dice.mean()
-    ssl_arch = arch_mean.idxmax()
-    cand = sorted([r for r in SUP if r["spec"]["arch"] == ssl_arch], key=val_score, reverse=True)
-    targets = cand if CFG["ssl_all_seeds"] else cand[:1]
+    ssl_archs = RANKED_ARCHS[:CFG["ssl_archs_top"]]
     unl_recs = load_unlabeled_records(CFG["frame"])
-    print(f"SSL sobre {ssl_arch} | {len(unl_recs)} imagens sem anotação (após filtro anti-fuga) | alvos: {[t['run_id'] for t in targets]}")
-    for tr in targets:
-        cur, prev_score = tr, val_score(tr)
+    print(f"SSL sobre {ssl_archs} (todos os membros/folds de cada uma) | {len(unl_recs)} imagens sem anotação (após filtro anti-fuga) | seleção: {CFG['ssl_select']} | rondas: {CFG['ssl_rounds']}")
+    for arch in ssl_archs:
+        cur = {rid: POOL[rid]["run"] for rid in VARIANTS[f"sup:{arch}"]}
         for rnd in range(CFG["ssl_rounds"]):
             if not BUDGET.ok(1200):
                 print("Orçamento de tempo: a parar rondas SSL."); break
-            r = train_ssl_round(tr, cur["ckpt"], rnd, unl_recs)
-            SSL_RESULTS.append(r)
-            gain = val_score(r) - prev_score
-            print(f"  ronda {rnd}: val macro-fg Dice {prev_score:.4f} -> {val_score(r):.4f} (Δ={gain:+.4f}) {'MELHOROU' if r['improved'] else 'sem ganho -> rollback e paragem'}")
-            if not r["improved"]:
-                break
-            cur, prev_score = r, val_score(r)
-        SSL_FINAL[tr["run_id"]] = cur
+            new = {}
+            for rid, run in cur.items():
+                if not BUDGET.ok(900):
+                    break
+                r = train_ssl_round(run, run["ckpt"], rnd, unl_recs)
+                new[rid] = r
+                SSL_RESULTS.append(r)
+                register_member(r, f"ssl{rnd}")
+            if new:
+                gains = [val_score(r) - r["val_before"]["macro_fg_dice"] for r in new.values()]
+                print(f"  {arch} ronda {rnd}: Δ macro-Dice médio no fold retido = {np.mean(gains):+.4f} (por membro: {[round(g, 3) for g in gains]})")
+            if len(new) < len(cur):
+                print(f"  ronda {rnd} incompleta ({len(new)}/{len(cur)} membros): a parar."); break
+            cur = new
     ALL_RESULTS += SSL_RESULTS
 elif not CFG["do_ssl"]:
     print("SSL desativado na configuração.")
@@ -241,3 +248,56 @@ if SSL_RESULTS:
         ax[3].plot(h.epoch, h[f"share_{c.lower()}"], label=c)
     ax[3].set_title("Proporção prevista por classe nos não anotados\n(deriva = sinal de viés de confirmação)"); ax[3].set_yscale("log"); ax[3].legend(fontsize=7)
     fig.tight_layout(); savefig(fig, "ssl_diagnostics.png"); plt.show()
+
+# %% [markdown]
+# ### 16b. O SSL ajuda? Efeito medido fora de amostra com bootstrap pareado
+# Compara, nas **mesmas imagens de desenvolvimento** (OOF), cada variante SSL com a variante supervisionada de que parte. Δ>0 com IC acima de 0 = ganho robusto.
+# Com `ssl_select="last"` não houve escolha da melhor época, logo o Δ não tem viés de seleção.
+
+# %%
+SSL_VARIANTS = [v for v in complete_variants() if v.startswith("ssl")]
+SSL_PAIRED = pd.DataFrame()
+if SSL_VARIANTS:
+    pairs = []
+    OOF_SSL = {v: eval_dev(variant_probs(v, "none")) for v in SSL_VARIANTS}
+    for v in SSL_VARIANTS:
+        sup_v = f"sup:{v.split(':', 1)[1]}"
+        if sup_v in OOF_SUP:
+            pairs.append((f"{v} vs {sup_v}", OOF_SSL[v], OOF_SUP[sup_v]))
+        prev = f"ssl{int(v[3:v.index(':')]) - 1}:{v.split(':', 1)[1]}" if v.startswith("ssl") and int(v[3:v.index(':')]) > 0 else None
+        if prev in OOF_SSL:
+            pairs.append((f"{v} vs {prev}", OOF_SSL[v], OOF_SSL[prev]))
+    SSL_PAIRED = paired_table(pairs)
+    SSL_PAIRED.to_csv(DIRS["tables"] / "paired_ssl_vs_sup_oof.csv", index=False)
+    print("SSL vs supervisionado (OOF, bootstrap pareado; Δ em pontos percentuais):")
+    display(SSL_PAIRED)
+else:
+    print("Sem variantes SSL completas: nada a comparar.")
+
+# %% [markdown]
+# ## 14b. Ablação (Experiência E) — indicativa
+# Retira-se **um** componente de cada vez à configuração de referência (mesma arquitetura, **uma só semente**, divisão oficial, nº de épocas curto).
+# Com 16 imagens de validação e uma semente, diferenças pequenas são ruído: leia como indicação de ordem de grandeza, não como prova. Corre depois do treino principal e do SSL
+# para não consumir o orçamento de tempo das experiências prioritárias.
+
+# %%
+ABL = []
+if CFG["do_ablation"] and BUDGET.ok(1800):
+    variants = {"referência": {}, "sem pré-treino": dict(pretrained=False), "sem augmentation (só flips)": dict(aug="flip"),
+                "sem class-aware sampling": dict(sampler=False), "só CE (sem Dice)": dict(loss="ce"), "sem freeze inicial": dict(freeze_epochs=0)}
+    for name, ov in variants.items():
+        if not BUDGET.ok(600):
+            break
+        r = train_run(default_spec(exp="ablation:" + name, arch=REF_ARCH, epochs=CFG["ablation_epochs"], patience=CFG["ablation_epochs"], keep_ckpt=False, **ov))
+        ABL.append(r)
+    ALL_RESULTS += ABL
+    abl_df = runs_table(ABL).assign(variante=[r["spec"]["exp"].split(":", 1)[1] for r in ABL])
+    abl_df = abl_df[["variante", "macro_fg_dice", "dice_fibrin", "dice_granulation", "dice_callus", "micro_fg_dice", "paper_dice"]]
+    abl_df["delta_macro_fg_vs_ref"] = abl_df.macro_fg_dice - abl_df.macro_fg_dice.iloc[0]
+    abl_df.to_csv(DIRS["tables"] / "ablation_val.csv", index=False)
+    display(abl_df.round(4))
+    fig, ax = plt.subplots(figsize=(8, 3.2))
+    ax.barh(abl_df.variante[::-1], abl_df.macro_fg_dice[::-1]); ax.set_xlabel("macro-Dice dos tecidos (validação oficial, 1 semente)")
+    fig.tight_layout(); savefig(fig, "ablation_val.png"); plt.show()
+else:
+    print("Ablação não executada (`do_ablation=False` ou sem orçamento de tempo).")

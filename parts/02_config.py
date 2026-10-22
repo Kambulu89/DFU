@@ -4,7 +4,8 @@
 # Escolha **`MODE`**:
 # * `smoke` — diagnóstico de pipeline (minutos, mesmo em CPU; modelo pequeno com pesos aleatórios; **os números não têm valor científico**);
 # * `quick` — primeira corrida real em GPU (2 arquiteturas, 1 semente, sem sondas nem ablação);
-# * `full` — experiência completa (3 arquiteturas × 3 sementes, sondas de *frame*/resolução e de perda, ablação, SSL em 2 rondas, *bootstrap* de 2000).
+# * `full` — experiência completa: **validação cruzada de 5 folds** nas 94 imagens de desenvolvimento com 3 arquiteturas, sondas de *frame*/resolução (256–512) e de perda,
+#   SSL em 2 rondas sobre todos os folds das 2 melhores arquiteturas (avaliado sem seleção de época), ablação, ajuste de pós-processamento no OOF e *bootstrap* de 2000.
 #
 # Todos os hiperparâmetros vivem em `CFG`; o dicionário completo, as sementes e as versões são gravados em `config.json`.
 
@@ -22,24 +23,31 @@ _BASE = dict(
     loss="ce_dice", label_smoothing=0.0, fibrin_boost=0.5, class_weight_cap=5.0,
     # fases opcionais
     do_sanity=True, do_lr_range=True, do_probes=False, do_ablation=False,
-    probe_epochs=40, ablation_epochs=40, probe_frames=[("padded", 256), ("roi", 256), ("roi", 384)],
+    probe_epochs=40, ablation_epochs=40, probe_frames=[("padded", 256), ("roi", 256), ("roi", 384), ("roi", 512)],
+    # validação cruzada nas 94 imagens de desenvolvimento (treino+val oficiais; o teste nunca entra)
+    do_cv=False, cv_folds=5, cv_seed=0,
+    cv_epochs={"unetpp_effb4": 130, "upernet_convnext_s": 70, "segformer_mitb3": 70, "smoke_fpn_r18": 2},  # épocas fixas (EMA final, sem seleção) -> OOF sem viés
     probe_losses=["ce_dice", "focal_dice", "focal_tversky", "ce_dice_lovasz"],
     # SSL
     do_ssl=True, ssl_rounds=2, ssl_epochs=40, ssl_steps_per_epoch=20, ssl_lambda_u=1.0, ssl_keep_frac=0.7,
-    ssl_tau_min=0.75, ssl_tau_max=0.97, ssl_all_seeds=False, ssl_dup_hamming=8,
+    ssl_tau_min=0.75, ssl_tau_max=0.97, ssl_dup_hamming=8,
+    ssl_select="best",      # 'best': melhor época na validação (com rollback) | 'last': pesos finais, sem seleção (avaliação não enviesada)
+    ssl_archs_top=1,        # nº de arquiteturas (melhores no OOF/val) a que se aplica SSL; todos os seus modelos/folds são usados
     # inferência / estatística
     tta_candidates=["none", "flip", "flip_ms"], pp_min_area_fracs=[0.0, 0.0005, 0.001, 0.002, 0.005],
-    bootstrap_b=2000, time_budget_hours=9.0, resume=True, seed_base=42,
+    pp_fibrin_fracs=[0.0, 0.001, 0.002, 0.005, 0.01], pp_scale_grid=[0.6, 0.8, 1.0, 1.25, 1.6], tune_class_scale=True, pp_gain_margin=0.002,
+    bootstrap_b=2000, paired_bootstrap_b=1000, time_budget_hours=9.0, resume=True, seed_base=42,
 )
 _MODES = {
     "smoke": dict(archs=["smoke_fpn_r18"], seeds=[0], epochs=3, patience=3, warmup_epochs=1, freeze_epochs=1, batch_size=8,
-                  ssl_rounds=1, ssl_epochs=2, ssl_steps_per_epoch=3, bootstrap_b=100, do_lr_range=True, num_workers=0,
+                  ssl_rounds=1, ssl_epochs=2, ssl_steps_per_epoch=3, bootstrap_b=100, paired_bootstrap_b=50, do_lr_range=True, num_workers=0,
+                  do_cv=True, cv_folds=2, ssl_select="last", pp_scale_grid=[0.8, 1.0, 1.25],
                   do_probes=True, probe_epochs=1, probe_frames=[("padded", 256), ("roi", 256)],
                   probe_losses=["ce_dice", "focal_tversky"], do_ablation=True, ablation_epochs=1, time_budget_hours=2.0),
     "quick": dict(archs=["unetpp_effb4", "segformer_mitb3"], seeds=[42], epochs=60, patience=20, ssl_rounds=1, ssl_epochs=30,
                   bootstrap_b=1000, time_budget_hours=4.0),
-    "full": dict(archs=["unetpp_effb4", "upernet_convnext_s", "segformer_mitb3"], seeds=[42, 43, 44], do_probes=True,
-                 do_ablation=True, ssl_all_seeds=False),
+    "full": dict(archs=["upernet_convnext_s", "segformer_mitb3", "unetpp_effb4"], seeds=[42], do_probes=True, do_ablation=True, do_cv=True,
+                 ssl_select="last", ssl_archs_top=2, ssl_rounds=2, ssl_epochs=30, time_budget_hours=10.0),
 }
 assert MODE in _MODES, f"MODE inválido: {MODE}"
 CFG = {**_BASE, **_MODES[MODE], "mode": MODE}

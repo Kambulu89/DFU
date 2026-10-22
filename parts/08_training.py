@@ -75,12 +75,28 @@ def predict_probs(models: list[nn.Module], items: EvalItems, tta: str = "none", 
     return out
 
 
-def remove_small_components(pred: np.ndarray, min_area_frac: float) -> np.ndarray:
-    """Remove componentes conexas de tecido com área < frac da área da imagem; o rótulo de substituição é a moda dos vizinhos (ou fundo)."""
-    if min_area_frac <= 0:
-        return pred
-    out, thr = pred.copy(), min_area_frac * pred.size
+DEFAULT_PP = dict(scale=[1.0, 1.0, 1.0, 1.0], min_frac=0.0, fibrin_frac=0.0)
+
+
+def norm_pp(pp) -> dict:
+    """Aceita None, um float (= área mínima global) ou um dict {scale, min_frac, fibrin_frac}."""
+    if pp is None:
+        return dict(DEFAULT_PP)
+    if isinstance(pp, (int, float)):
+        return {**DEFAULT_PP, "min_frac": float(pp)}
+    return {**DEFAULT_PP, **pp}
+
+
+def remove_small_components(pred: np.ndarray, pp) -> np.ndarray:
+    """Remove componentes conexas de tecido abaixo de uma fração da área da imagem (global `min_frac`; a fibrina usa o maior de `min_frac` e `fibrin_frac`).
+    O rótulo de substituição é a moda dos vizinhos (ou fundo)."""
+    pp = norm_pp(pp)
+    out = pred.copy()
     for c in TISSUES:
+        frac = max(pp["min_frac"], pp["fibrin_frac"] if c == 1 else 0.0)
+        if frac <= 0:
+            continue
+        thr = frac * pred.size
         n, lab, stats, _ = cv2.connectedComponentsWithStats((out == c).astype(np.uint8), connectivity=8)
         for comp in range(1, n):
             if stats[comp, cv2.CC_STAT_AREA] < thr:
@@ -91,13 +107,16 @@ def remove_small_components(pred: np.ndarray, min_area_frac: float) -> np.ndarra
     return out
 
 
-def probs_to_preds(probs: list[np.ndarray], min_area_frac: float = 0.0) -> list[np.ndarray]:
-    return [remove_small_components(p.argmax(0).astype(np.uint8), min_area_frac) for p in probs]
+def probs_to_preds(probs: list[np.ndarray], pp=0.0) -> list[np.ndarray]:
+    """Escala as probabilidades por classe (a priori ajustável), faz argmax e remove componentes pequenas. `pp` como em `norm_pp`."""
+    pp = norm_pp(pp)
+    sc = np.asarray(pp["scale"], np.float32)[:, None, None]
+    return [remove_small_components((p * sc).argmax(0).astype(np.uint8), pp) for p in probs]
 
 
-def evaluate_models(models, items: EvalItems, tta: str = "none", weights=None, min_area_frac: float = 0.0):
+def evaluate_models(models, items: EvalItems, tta: str = "none", weights=None, pp=0.0):
     probs = predict_probs(models, items, tta, weights)
-    return evaluate_preds(items.names, items.gts, probs_to_preds(probs, min_area_frac)), probs
+    return evaluate_preds(items.names, items.gts, probs_to_preds(probs, pp)), probs
 
 
 @torch.no_grad()
@@ -149,6 +168,37 @@ def lr_factor(step: int, warm: int, total: int, min_ratio: float) -> float:
     return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * min(t, 1.0)))
 
 
+_FOLD_CACHE: dict[tuple, dict[str, int]] = {}
+
+
+def fold_assignment(k: int, seed: int) -> dict[str, int]:
+    """Folds estratificados das 94 imagens de DESENVOLVIMENTO (treino+val oficiais; o teste nunca entra). Estratos: sem fibrina / pouca / muita fibrina
+    (metade inferior/superior das que têm). Distribuição circular com contador contínuo -> folds de tamanho equilibrado; determinístico dado `seed`."""
+    if (k, seed) not in _FOLD_CACHE:
+        dev = get_frame("roi")["train"] + get_frame("roi")["val"]
+        fr = np.array([(r["mask"] == 1).sum() / max(1, (r["mask"] > 0).sum()) for r in dev])
+        pres = np.where(fr > 0)[0]
+        pres = pres[np.argsort(fr[pres], kind="stable")]
+        strata = [np.where(fr == 0)[0], pres[: len(pres) // 2], pres[len(pres) // 2:]]
+        rng, assign, ctr = np.random.default_rng(seed), {}, 0
+        for st in strata:
+            for i in rng.permutation(st):
+                assign[dev[i]["name"]] = ctr % k
+                ctr += 1
+        _FOLD_CACHE[(k, seed)] = assign
+    return _FOLD_CACHE[(k, seed)]
+
+
+def split_for(spec: dict) -> tuple[list[dict], list[dict]]:
+    """(treino, validação) de uma execução: divisão oficial (fold=None) ou fold k da validação cruzada nas 94 imagens de desenvolvimento."""
+    recs = get_frame(spec["frame"])
+    if spec.get("fold") is None:
+        return recs["train"], recs["val"]
+    fm = fold_assignment(spec["n_folds"], CFG["cv_seed"])
+    dev = recs["train"] + recs["val"]
+    return [r for r in dev if fm[r["name"]] != spec["fold"]], [r for r in dev if fm[r["name"]] == spec["fold"]]
+
+
 def run_id_of(spec: dict) -> str:
     h = hashlib.md5(json.dumps(spec, sort_keys=True, default=str).encode()).hexdigest()[:8]
     return f"{spec['exp']}__{spec['arch']}__s{spec['seed']}__{h}"
@@ -157,7 +207,7 @@ def run_id_of(spec: dict) -> str:
 def default_spec(**over) -> dict:
     s = dict(exp="sup", arch=CFG["archs"][0], seed=CFG["seeds"][0], frame=CFG["frame"], size=CFG["size"], loss=CFG["loss"], epochs=CFG["epochs"],
              patience=CFG["patience"], pretrained=True, aug="standard", sampler=True, lr_decoder=CFG["lr_decoder"], lr_encoder=CFG["lr_encoder"],
-             freeze_epochs=CFG["freeze_epochs"], batch_size=CFG["batch_size"], keep_ckpt=True)
+             freeze_epochs=CFG["freeze_epochs"], batch_size=CFG["batch_size"], keep_ckpt=True, fold=None, n_folds=None, selection="best")
     s.update(over)
     return s
 
@@ -177,14 +227,14 @@ def _train_run(spec: dict, micro_bs_hint: int | None = None) -> dict:
     rdir.mkdir(parents=True, exist_ok=True)
     seed_everything(spec["seed"])
     S = spec["size"]
-    recs = get_frame(spec["frame"])
-    train_set = SegSet(recs["train"], S, aug=spec["aug"])
-    val_items = EvalItems(recs["val"], S)
+    tr_recs, va_recs = split_for(spec)
+    train_set = SegSet(tr_recs, S, aug=spec["aug"])
+    val_items = EvalItems(va_recs, S)
     loader = make_train_loader(train_set, spec["batch_size"], CFG["fibrin_boost"] if spec["sampler"] else 0.0, spec["seed"])
     model, prov = build_model(spec["arch"], spec["pretrained"])
     model.to(DEVICE)
     micro_bs = micro_bs_hint or probe_micro_batch(model, S, spec["batch_size"])
-    criterion = SegLoss(spec["loss"], class_weights_from(recs["train"], CFG["class_weight_cap"]), CFG["label_smoothing"]).to(DEVICE)
+    criterion = SegLoss(spec["loss"], class_weights_from(tr_recs, CFG["class_weight_cap"]), CFG["label_smoothing"]).to(DEVICE)
     opt = torch.optim.AdamW([{"params": model.encoder_params(), "lr": spec["lr_encoder"]}, {"params": model.other_params(), "lr": spec["lr_decoder"]}],
                             weight_decay=CFG["weight_decay"])
     spe = len(loader)
@@ -244,7 +294,9 @@ def _train_run(spec: dict, micro_bs_hint: int | None = None) -> dict:
                          val_macro_fg_dice=vm["macro_fg_dice"], val_micro_fg_dice=vm["micro_fg_dice"], val_macro_fg_iou=vm["macro_fg_iou"],
                          val_paper_dice=vm["paper_dice"], val_dice_fibrin=vm["dice_fibrin"], val_dice_granulation=vm["dice_granulation"],
                          val_dice_callus=vm["dice_callus"], lr_dec=opt.param_groups[1]["lr"]))
-        if score > best + 1e-4:
+        if spec.get("selection", "best") == "last":     # sem seleção de época: o modelo avaliado é o EMA final (estimativa OOF não enviesada)
+            best, best_epoch, bad = score, epoch, 0
+        elif score > best + 1e-4:
             best, best_epoch, bad = score, epoch, 0
             _save_half(ema.module.state_dict(), rdir / "best.pt")
         else:
@@ -259,11 +311,13 @@ def _train_run(spec: dict, micro_bs_hint: int | None = None) -> dict:
             status = "early_stopped"
             break
 
-    # reavalia o MELHOR checkpoint carregado de disco (fp16->fp32), para que o resultado seja o do artefacto guardado
+    if spec.get("selection", "best") == "last":
+        _save_half(ema.module.state_dict(), rdir / "best.pt")
+    # reavalia o MELHOR checkpoint (ou o último, se selection='last') carregado de disco (fp16->fp32), para que o resultado seja o do artefacto guardado
     final = Net(ARCH_SPECS[spec["arch"]]["ctor"](None)).to(DEVICE)
     final.load_state_dict(_load_half(rdir / "best.pt"))
     res, _ = evaluate_models([final], val_items, "none")
-    result = dict(spec=spec, run_id=rid, status=status, best_epoch=best_epoch, epochs_run=len(hist), val=res.metrics(), history=hist, provenance=prov,
+    result = dict(spec=spec, run_id=rid, status=status, best_epoch=best_epoch, epochs_run=len(hist), val=res.metrics(), val_names=[r["name"] for r in va_recs], history=hist, provenance=prov,
                   params_M=round(count_params(model), 2), micro_batch=micro_bs, train_seconds=round(time.time() - t0, 1), ckpt=str(rdir / "best.pt"),
                   device=HW["gpu_name"] or "cpu")
     (rdir / "result.json").write_text(json.dumps(result, indent=1, default=float))

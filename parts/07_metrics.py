@@ -99,7 +99,7 @@ class EvalResult:
     def __len__(self):
         return len(self.names)
 
-    def metrics(self, idx=None) -> dict:
+    def metrics(self, idx=None, light: bool = False) -> dict:
         idx = np.arange(len(self)) if idx is None else np.asarray(idx)
         cm = self.cms[idx].sum(0)
         pc = per_class_from_cm(cm)
@@ -126,13 +126,15 @@ class EvalResult:
             n = CLASS_NAMES[k].lower()
             for key in ("dice", "iou", "precision", "recall"):
                 out[f"{key}_{n}"] = float(pc[key][k])
+            if light:
+                continue
             if k in fg:
                 col = pp[:, k, :]
                 ok = ~np.isnan(col[:, 2])
                 for j, key in enumerate(("precision", "recall", "dice", "iou")):
                     out[f"paper_{key}_{n}"] = float(col[ok, j].mean() / 100) if ok.any() else np.nan
         # média por imagem (só onde a classe existe em GT ou predição)
-        for k in fg:
+        for k in ([] if light else fg):
             d = np.array([per_class_from_cm(m)["dice"][k] for m in self.cms[idx]])
             out[f"imgmean_dice_{CLASS_NAMES[k].lower()}"] = float(np.nanmean(d)) if (~np.isnan(d)).any() else np.nan
         return out
@@ -141,11 +143,34 @@ class EvalResult:
         rng = np.random.default_rng(seed)
         draws = {k: [] for k in keys}
         n = len(self)
+        light = all(k in self.metrics(light=True) for k in keys)
         for _ in range(B):
-            m = self.metrics(rng.integers(0, n, n))
+            m = self.metrics(rng.integers(0, n, n), light=light)
             for k in keys:
                 draws[k].append(m[k])
         return {k: tuple(np.nanpercentile(v, [2.5, 97.5])) for k, v in draws.items()}
+
+
+def paired_bootstrap(a: "EvalResult", b: "EvalResult", keys: list[str], B: int, seed: int = 0) -> dict:
+    """Bootstrap PAREADO sobre as mesmas imagens: distribuição de (métrica_a - métrica_b). Devolve delta, IC 95 % e P(delta>0)."""
+    if a.names != b.names:
+        raise ValueError("Os dois resultados têm de cobrir as mesmas imagens, pela mesma ordem")
+    rng = np.random.default_rng(seed)
+    n = len(a)
+    light = all(k in a.metrics(light=True) for k in keys)
+    d = {k: [] for k in keys}
+    for _ in range(B):
+        idx = rng.integers(0, n, n)
+        ma, mb = a.metrics(idx, light=light), b.metrics(idx, light=light)
+        for k in keys:
+            d[k].append(ma[k] - mb[k])
+    pa, pb = a.metrics(light=light), b.metrics(light=light)
+    out = {}
+    for k in keys:
+        v = np.array(d[k], float)
+        lo, hi = np.nanpercentile(v, [2.5, 97.5])
+        out[k] = dict(delta=pa[k] - pb[k], lo=float(lo), hi=float(hi), p_gt0=float(np.nanmean(v > 0)))
+    return out
 
 
 def evaluate_preds(names: list[str], gts: list[np.ndarray], preds: list[np.ndarray]) -> EvalResult:
@@ -195,6 +220,13 @@ def run_metric_tests() -> None:
     g = [rng.integers(0, 4, (20, 20)) for _ in range(12)]; p = [np.where(rng.random((20, 20)) < 0.7, x, rng.integers(0, 4, (20, 20))) for x in g]
     r = evaluate_preds([str(i) for i in range(12)], g, p); ci = r.bootstrap(["macro_fg_dice"], 200)["macro_fg_dice"]
     assert ci[0] <= r.metrics()["macro_fg_dice"] <= ci[1]
+    # 9) bootstrap pareado: A=B -> delta 0; A melhor que B (predições com menos ruído) -> delta>0 e P>0.9
+    pb = [np.where(rng.random((20, 20)) < 0.4, x, rng.integers(0, 4, (20, 20))) for x in g]
+    rb = evaluate_preds([str(i) for i in range(12)], g, pb)
+    z = paired_bootstrap(r, r, ["macro_fg_dice"], 50)["macro_fg_dice"]
+    assert z["delta"] == 0 and z["lo"] == 0 and z["hi"] == 0
+    zz = paired_bootstrap(r, rb, ["macro_fg_dice"], 200)["macro_fg_dice"]
+    assert zz["delta"] > 0 and zz["p_gt0"] > 0.9, zz
     print("OK: testes de métricas (exemplo conhecido, perfeito, vazias, ausentes, desalinhamento, sklearn, réplica==porta literal em 150 casos, bootstrap)")
 
 
