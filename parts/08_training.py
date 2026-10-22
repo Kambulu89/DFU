@@ -295,7 +295,9 @@ def train_run(spec: dict) -> dict:
 # Se não conseguir, há um erro de pipeline, não de hiperparâmetros. O *LR range test* é só consultivo (não altera `CFG`).
 
 # %%
-def sanity_overfit(arch: str, n_img: int = 8, steps: int = 80, thr: float = 0.85) -> float:
+def sanity_overfit(arch: str, n_img: int = 8, steps: int = 80, thr: float = 0.85, max_steps: int = 400, check_every: int = 40) -> float:
+    """Treina em `n_img` imagens sem augmentation até o macro-Dice dos tecidos (no próprio treino) atingir `thr`, com um máximo de `max_steps`.
+    Só falha se, mesmo com passos de sobra, não conseguir memorizar — aí há de facto um erro de pipeline (dados, máscaras, perda ou métricas)."""
     seed_everything(0)
     S, recs = CFG["size"], get_frame(CFG["frame"])
     sub = recs["train"][:n_img]
@@ -306,8 +308,11 @@ def sanity_overfit(arch: str, n_img: int = 8, steps: int = 80, thr: float = 0.85
     crit = SegLoss("ce_dice", class_weights_from(sub, CFG["class_weight_cap"])).to(DEVICE)
     opt = torch.optim.AdamW([{"params": model.encoder_params(), "lr": 3e-4}, {"params": model.other_params(), "lr": 2e-3}], weight_decay=0.0)
     mb = probe_micro_batch(model, S, len(sub))
-    it = 0
-    while it < steps:
+    limit = steps if MODE == "smoke" else max_steps
+    every = steps if MODE == "smoke" else check_every
+    it, d, traj = 0, 0.0, []
+    while it < limit:
+        model.train()
         for xb, yb in loader:
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
             opt.zero_grad(set_to_none=True)
@@ -316,17 +321,23 @@ def sanity_overfit(arch: str, n_img: int = 8, steps: int = 80, thr: float = 0.85
                     lg = model(xc)
                 (crit(lg.float(), yc) * len(xc) / len(xb)).backward()
             opt.step(); it += 1
-            if it >= steps:
+            if it % every == 0 or it >= limit:
                 break
-    res, _ = evaluate_models([model], items, "none")
-    d = res.metrics()["macro_fg_dice"]
+        if it % every == 0 or it >= limit:
+            res, _ = evaluate_models([model], items, "none")
+            d = res.metrics()["macro_fg_dice"]
+            d = 0.0 if np.isnan(d) else d
+            traj.append((it, round(d, 3)))
+            if d >= thr:
+                break
     verdict = "OK" if d >= thr else ("AVISO (modo smoke: poucos passos)" if MODE == "smoke" else "FALHA")
-    print(f"Sanity overfit [{arch}] {n_img} imagens, {steps} passos: macro-fg Dice (treino) = {d:.3f} (limiar {thr}) -> {verdict}")
+    print(f"Sanity overfit [{arch}] {n_img} imagens: macro-fg Dice (treino) = {d:.3f} (limiar {thr}) após {it} passos | trajetória (passo, Dice): {traj} -> {verdict}")
     del model, opt
     if DEVICE.type == "cuda":
         torch.cuda.empty_cache()
     if MODE != "smoke" and d < thr:
-        raise RuntimeError(f"O modelo {arch} não consegue memorizar {n_img} imagens (Dice {d:.3f}<{thr}). Há um problema de pipeline: não prossiga.")
+        raise RuntimeError(f"O modelo {arch} não consegue memorizar {n_img} imagens (Dice {d:.3f}<{thr} após {it} passos). Há um problema de pipeline: não prossiga. "
+                           f"Se a trajetória ainda estava a subir, aumente `max_steps`; para ignorar esta verificação defina CFG['do_sanity']=False.")
     return d
 
 
