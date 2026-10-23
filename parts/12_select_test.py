@@ -1,12 +1,13 @@
 # %% [markdown]
 # ## 17–18. Comparação de experiências, *ensemble*, TTA e pós-processamento (Experiência D) — **só desenvolvimento (OOF/validação)**
 #
-# Enumeram-se **candidatos** (cada variante isolada, *ensemble* de todas as supervisionadas, das duas melhores, por ronda SSL e de tudo). Para cada candidato escolhem-se
-# **no conjunto de desenvolvimento**: o TTA (`none`/`flip`/`flip_ms`, com histerese) e o pós-processamento (escala de probabilidade por classe, área mínima global e da fibrina, com histerese por passo).
-# As probabilidades são **médias uniformes** (afinar pesos de *ensemble* sobreajustaria). O candidato final é o de maior macro-Dice dos tecidos (empate → menos modelos).
+# Enumeram-se **candidatos** (cada variante isolada, *ensemble* de todas as supervisionadas, das duas melhores, por tipo de SSL e de tudo). Para cada candidato escolhe-se
+# **no conjunto de desenvolvimento** o TTA (`none`/`flip`/`flip_ms`, com histerese) e **o candidato final é o de maior macro-Dice dos tecidos com esse TTA** (empate → menos modelos).
+# As probabilidades são **médias uniformes** (afinar pesos de *ensemble* sobreajustaria).
 #
-# **Viés de ajuste.** Escolher TTA/pós-processamento nas mesmas imagens onde se mede é otimista; por isso mede-se também o **ganho "honesto"** do pós-processamento
-# (ajustado numa metade das imagens e avaliado na outra). **O teste continua intocado nesta secção.**
+# **Pós-processamento (escala de probabilidade por classe, área mínima global e da fibrina) com porta de segurança.** É ajustado **apenas para o candidato vencedor** e só é **aplicado se o ganho
+# "honesto" for superior a 0,2 pp** (ajustado numa metade das imagens e avaliado na outra; média de 10 repetições). Na corrida anterior esse ganho foi −0,24 pp: o ajuste era sobreajuste, e é isso que a
+# porta evita. **O teste continua intocado nesta secção.**
 
 # %%
 ALL_VARS = complete_variants()
@@ -46,36 +47,39 @@ for name, vs in CANDS.items():
             best_tta = (sc, tta)
     tta = best_tta[1]
     pr = cand_probs(vs, tta)
-    pp, sc_base, sc_tuned = tune_postproc(pr)
-    res = eval_dev(pr, pp).metrics()
-    TUNED[name] = dict(variants=vs, members=members_of(vs), tta=tta, pp=pp, dev=res, dev_raw=per_tta["none"])
-    rows.append(dict(candidato=name, n_modelos=len(TUNED[name]["members"]), tta=tta, escala_classes=[round(x, 2) for x in pp["scale"][1:]], area_min=pp["min_frac"], area_min_fibrina=pp["fibrin_frac"],
-                     dev_macro_fg_bruto=per_tta["none"], dev_macro_fg_ajustado=res["macro_fg_dice"], dev_micro_fg=res["micro_fg_dice"], dev_paper_dice=res["paper_dice"],
-                     dev_fibrin=res["dice_fibrin"], dev_granulation=res["dice_granulation"], dev_callus=res["dice_callus"]))
-CAND_TABLE = pd.DataFrame(rows).sort_values(["dev_macro_fg_ajustado", "n_modelos"], ascending=[False, True]).reset_index(drop=True)
+    res = eval_dev(pr, 0.0).metrics()
+    TUNED[name] = dict(variants=vs, members=members_of(vs), tta=tta, pp=norm_pp(None), dev=res, dev_raw=per_tta["none"])
+    rows.append(dict(candidato=name, n_modelos=len(TUNED[name]["members"]), tta=tta, dev_macro_fg_sem_tta=per_tta["none"], dev_macro_fg=res["macro_fg_dice"], dev_micro_fg=res["micro_fg_dice"],
+                     dev_paper_dice=res["paper_dice"], dev_fibrin=res["dice_fibrin"], dev_granulation=res["dice_granulation"], dev_callus=res["dice_callus"]))
+CAND_TABLE = pd.DataFrame(rows).sort_values(["dev_macro_fg", "n_modelos"], ascending=[False, True]).reset_index(drop=True)
 CAND_TABLE.to_csv(DIRS["tables"] / "candidates_dev.csv", index=False)
 print(f"Candidatos ({'OOF, 94 imagens' if CFG['do_cv'] else 'validação oficial, 16 imagens'}; a seleção usa só estas colunas — o teste não foi lido):")
 display(CAND_TABLE.round(4))
 FINAL_NAME = CAND_TABLE.candidato.iloc[0]
 FINAL = TUNED[FINAL_NAME]
-print(f"\nCandidato final escolhido: {FINAL_NAME} | {len(FINAL['members'])} modelos | TTA={FINAL['tta']} | pós-proc.: {FINAL['pp']}")
-print("Nota: o valor de desenvolvimento do vencedor é otimista (escolha entre vários candidatos e ajuste de TTA/pós-processamento nas mesmas imagens).")
+print(f"\nCandidato final escolhido: {FINAL_NAME} | {len(FINAL['members'])} modelos | TTA={FINAL['tta']}")
+print("Nota: o valor de desenvolvimento do vencedor é otimista (escolha entre vários candidatos e do TTA nas mesmas imagens).")
+
+# pós-processamento só para o vencedor, com porta de segurança (ganho honesto > 0)
+_probs_final = cand_probs(FINAL["variants"], FINAL["tta"])
+_pp_try, _sc0, _sc1 = tune_postproc(_probs_final)
+PP_HONEST_GAIN = pp_honest_gain(_probs_final)
+PP_ACCEPTED = PP_HONEST_GAIN[0] > CFG["pp_gain_margin"] and _sc1 > _sc0      # ganho honesto médio > 0,2 pp
+print(f"Pós-processamento candidato: {_pp_try} | ganho no próprio desenvolvimento: {100 * (_sc1 - _sc0):+.2f} pp | ganho HONESTO (metade/metade, 10 reps): {100 * PP_HONEST_GAIN[0]:+.2f} ± {100 * PP_HONEST_GAIN[1]:.2f} pp"
+      f" -> {'ACEITE' if PP_ACCEPTED else 'REJEITADO (sem ganho honesto): o modelo final usa só o TTA'}")
+FINAL["pp"] = _pp_try if PP_ACCEPTED else norm_pp(None)
 
 # %%
 # Efeito do TTA/pós-processamento e do ensemble sobre o melhor supervisionado — medidos no desenvolvimento com bootstrap pareado
 best_sup_v = OOF_TABLE.variante.iloc[0]
 raw_final = eval_dev(cand_probs(FINAL["variants"], "none"))
 tuned_final = eval_dev(cand_probs(FINAL["variants"], FINAL["tta"]), FINAL["pp"])
-pairs = [(f"FINAL ajustado vs FINAL bruto (in-sample)", tuned_final, raw_final)]
+pairs = [(f"FINAL (TTA{' + pós-proc.' if PP_ACCEPTED else ''}) vs FINAL sem TTA", tuned_final, raw_final)]
 if best_sup_v not in FINAL["variants"] or len(FINAL["variants"]) > 1:
-    pairs.append((f"FINAL ajustado vs {best_sup_v} bruto", tuned_final, OOF_SUP[best_sup_v]))
+    pairs.append((f"FINAL vs {best_sup_v} (sem TTA)", tuned_final, OOF_SUP[best_sup_v]))
 DEV_PAIRED = paired_table(pairs, ["macro_fg_dice", "paper_dice", "dice_fibrin", "dice_callus"])
 display(DEV_PAIRED)
 DEV_PAIRED.to_csv(DIRS["tables"] / "paired_final_dev.csv", index=False)
-g, gs = pp_honest_gain(cand_probs(FINAL["variants"], FINAL["tta"]))
-print(f"Ganho honesto do pós-processamento (ajusta numa metade, avalia na outra; 10 repetições): {100 * g:+.2f} pp ± {100 * gs:.2f} (macro-Dice dos tecidos)."
-      f" Se for ~0 ou negativo, o ganho in-sample acima é sobreajuste.")
-PP_HONEST_GAIN = (g, gs)
 
 # %% [markdown]
 # ## 19. Avaliação final no **teste** (uma única vez)
@@ -111,7 +115,7 @@ spec_rows = [(f"Nosso: melhor supervisionado = {best_sup_v} (ensemble de {len(VA
 ssl_ranked = sorted(SSL_V, key=lambda v: -eval_dev(variant_probs(v, "none")).metrics(light=True)["macro_fg_dice"]) if SSL_V else []
 if ssl_ranked:
     spec_rows.append((f"Nosso: melhor SSL = {ssl_ranked[0]} (ensemble de {len(VARIANTS[ssl_ranked[0]])}, sem TTA)", VARIANTS[ssl_ranked[0]], "none", 0.0))
-spec_rows.append((f"Nosso: FINAL = {FINAL_NAME} (TTA={FINAL['tta']}, pp ajustado)", FINAL["members"], FINAL["tta"], FINAL["pp"]))
+spec_rows.append((f"Nosso: FINAL = {FINAL_NAME} (TTA={FINAL['tta']}{', pp aceite' if PP_ACCEPTED else ''})", FINAL["members"], FINAL["tta"], FINAL["pp"]))
 for label, members, tta, pp in spec_rows:
     res, pr = evaluate_test(label, members, tta, pp)
     TEST_ROWS[label] = dict(res=res, probs=pr, members=members, tta=tta, pp=pp, metrics=res.metrics())

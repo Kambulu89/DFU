@@ -8,6 +8,8 @@
 # | `unetpp_effb4` | U-Net++ (`smp`) | EfficientNet-B4 `ra2_in1k` (timm) | CNN eficiente, *skip connections* densas — **referência** |
 # | `upernet_convnext_s` | UPerNet (`smp`) | ConvNeXt-S `fb_in22k_ft_in1k` (timm) | CNN moderna com pirâmide multiescala/contexto global |
 # | `segformer_mitb3` | SegFormer (`smp`) | MiT-B3 ImageNet-1k (NVlabs, via `smp`) | Transformer hierárquico (encoder do artigo, mas **sem** P-scSE) |
+# | `upernet_convnext_b` | UPerNet (`smp`) | ConvNeXt-B `fb_in22k_ft_in1k` (timm) | versão maior da melhor CNN (candidata no modo `full`) |
+# | `segformer_mitb5` | SegFormer (`smp`) | MiT-B5 ImageNet-1k (NVlabs, via `smp`) | versão maior do Transformer (candidata no modo `full`) |
 #
 # **Origem dos pesos.** `build_model` tenta, por esta ordem: (1) descarregar pesos pré-treinados (precisa de Internet); (2) carregar um
 # ficheiro local (`.pth/.pt/.bin/.safetensors`) encontrado em `/kaggle/input` cujo nome/pasta contenha a chave do encoder
@@ -28,6 +30,14 @@ ARCH_SPECS = {
     "segformer_mitb3": dict(
         ctor=lambda w: smp.Segformer("mit_b3", encoder_weights=w, classes=K, in_channels=3),
         key="mit_b3", family="Transformer", origin="NVlabs SegFormer MiT-B3 ImageNet-1k (distribuído por smp / HF)",
+        license="NVIDIA Source Code License (não comercial) — confirmar antes de uso comercial"),
+    "upernet_convnext_b": dict(
+        ctor=lambda w: smp.UPerNet("tu-convnext_base.fb_in22k_ft_in1k", encoder_weights=w, classes=K, in_channels=3),
+        key="convnext_base", family="CNN", origin="timm convnext_base.fb_in22k_ft_in1k (ImageNet-22k -> 1k, Meta AI)",
+        license="ver model card timm/convnext_base.fb_in22k_ft_in1k (código ConvNeXt: MIT; confirmar nos pesos)"),
+    "segformer_mitb5": dict(
+        ctor=lambda w: smp.Segformer("mit_b5", encoder_weights=w, classes=K, in_channels=3),
+        key="mit_b5", family="Transformer", origin="NVlabs SegFormer MiT-B5 ImageNet-1k (distribuído por smp / HF)",
         license="NVIDIA Source Code License (não comercial) — confirmar antes de uso comercial"),
     "smoke_fpn_r18": dict(  # apenas para o modo smoke (teste de pipeline)
         ctor=lambda w: smp.FPN("resnet18", encoder_weights=w, classes=K, in_channels=3),

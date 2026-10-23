@@ -6,7 +6,7 @@
 # `DFU_INPUT` (dados) e `DFU_WORK` (saídas) ou pastas locais.
 
 # %%
-import os, sys, platform, subprocess, importlib, json, time, math, random, shutil, hashlib, glob, warnings, itertools, copy, socket
+import os, re, sys, platform, subprocess, importlib, json, time, math, random, shutil, hashlib, glob, warnings, itertools, copy, socket
 from pathlib import Path
 from collections import OrderedDict, defaultdict
 

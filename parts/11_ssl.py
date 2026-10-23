@@ -225,6 +225,174 @@ elif not CFG["do_ssl"]:
 else:
     print("SSL OMITIDO: sem imagens não anotadas utilizáveis (ou sem orçamento de tempo). O notebook continua em modo supervisionado.")
 
+# %% [markdown]
+# ### 16a. SSL com **professor ensemble limpo por fold** (`ssl_ens`)
+# O professor EMA de um só modelo herda os erros desse modelo. Aqui as *pseudo-labels* vêm do **ensemble (com TTA) de todas as arquiteturas supervisionadas do mesmo fold**, que é mais exato do
+# que qualquer membro isolado. Para o OOF continuar **sem fuga**, o professor do fold *f* só usa modelos desse fold, que **nunca viram as imagens retidas do fold *f***; as imagens sem anotação
+# não coincidem com val/teste (filtro dHash). As *pseudo-labels* são calculadas **uma vez** (offline), limiares de confiança **por classe** (percentil `ssl_keep_frac`, limites `ssl_tau_*`),
+# píxeis incertos viram *ignore*, e o aluno (parte do modelo supervisionado do fold) treina com perda supervisionada + perda nas *pseudo-labels* sob vista forte (fotometria + CutMix),
+# com *ramp-up*. O resultado é a variante `ssle:<arquitetura>`, comparada por bootstrap pareado com a supervisionada e com o SSL EMA.
+
+# %%
+class _Packed:
+    """Pseudo-labels de um fold: máscaras uint8 na tela (0..3 = classe; 4 = ignorar) + estatísticas."""
+
+    def __init__(self, packed: np.ndarray, tau: np.ndarray, kept: np.ndarray, share: np.ndarray, n_teachers: int):
+        self.packed, self.tau, self.kept, self.share, self.n_teachers = packed, tau, kept, share, n_teachers
+
+
+def _unlabeled_canvas_items(unl_recs: list[dict], S: int) -> list[dict]:
+    items = []
+    for r in unl_recs:
+        g = letterbox_geom(*r["img"].shape[:2], S)
+        c, _, v = apply_letterbox(r["img"], None, g)
+        items.append(dict(name=r["name"], img=c, valid=v))
+    return items
+
+
+_PL_CACHE: dict = {}
+
+
+@torch.no_grad()
+def fold_pseudo_labels(fold, items: list[dict]) -> _Packed:
+    if fold in _PL_CACHE:
+        return _PL_CACHE[fold]
+    teachers = [rid for rid, e in POOL.items() if e["kind"] == "sup" and e["fold"] == fold]
+    assert teachers, f"Sem modelos supervisionados para o fold {fold}"
+    models = [load_pool_model(r) for r in teachers]
+    pl_all, conf_all = [], []
+    for i in range(0, len(items), 8):
+        x = torch.stack([to_tensor01(it["img"]) for it in items[i:i + 8]]).to(DEVICE)
+        p = sum(canvas_probs(m, x, CFG["ssl_ens_tta"]) for m in models) / len(models)
+        conf, pl = p.max(1)
+        pl_all.append(pl.to(torch.uint8).cpu()); conf_all.append(conf.half().cpu())
+    pl, conf = torch.cat(pl_all).numpy(), torch.cat(conf_all).numpy().astype(np.float32)
+    tau = np.zeros(K)
+    rng = np.random.default_rng(0)
+    for c in range(K):
+        sel = conf[pl == c]
+        if sel.size > 200:
+            sel = sel[rng.integers(0, sel.size, min(sel.size, 2_000_000))]
+            tau[c] = float(np.clip(np.quantile(sel, 1 - CFG["ssl_keep_frac"]), CFG["ssl_tau_min"], CFG["ssl_tau_max"]))
+        else:
+            tau[c] = CFG["ssl_tau_max"]
+    keep = conf >= tau[pl]
+    packed = np.where(keep, pl, 4).astype(np.uint8)
+    kept = np.array([(keep & (pl == c)).sum() / max((pl == c).sum(), 1) for c in range(K)])
+    share = np.array([(pl == c).mean() for c in range(K)])
+    _PL_CACHE[fold] = _Packed(packed, tau, kept, share, len(teachers))
+    return _PL_CACHE[fold]
+
+
+def train_ssl_ens_round(sup_run: dict, items: list[dict], pl: _Packed) -> dict:
+    spec = dict(sup_run["spec"]) | dict(exp="ssle", epochs=CFG["ssl_epochs"], init=sup_run["ckpt"], keep_frac=CFG["ssl_keep_frac"], tau=[CFG["ssl_tau_min"], CFG["ssl_tau_max"]],
+                lambda_u=CFG["ssl_lambda_u"], ssl_steps=CFG["ssl_steps_per_epoch"], n_unl=len(items), ssl_select="last", teacher="ensemble_same_fold")
+    rid = run_id_of(spec)
+    rdir = DIRS["runs"] / rid
+    rf = rdir / "result.json"
+    if rf.exists() and CFG["resume"]:
+        print(f"[reutilizado] {rid}")
+        return json.loads(rf.read_text())
+    rdir.mkdir(parents=True, exist_ok=True)
+    seed_everything(spec["seed"] + 7000)
+    S, bs = spec["size"], spec["batch_size"]
+    tr_recs, va_recs = split_for(spec)
+    lab_set = SegSet(tr_recs, S, aug="standard")
+    unl_set = CanvasSegSet([dict(img=it["img"], mask=pl.packed[j], valid=it["valid"]) for j, it in enumerate(items)], aug="weak")
+    val_items = EvalItems(va_recs, S)
+    nw = CFG["num_workers"]
+    mk = lambda ds, sampler: torch.utils.data.DataLoader(ds, batch_size=bs, sampler=sampler, num_workers=nw, drop_last=True, worker_init_fn=worker_init,  # noqa: E731
+                                                          pin_memory=DEVICE.type == "cuda", persistent_workers=nw > 0)
+    big = 10**6
+    lab_w = torch.as_tensor(lab_set.sample_weights(CFG["fibrin_boost"]), dtype=torch.double)
+    lab_it = _cycle(mk(lab_set, torch.utils.data.WeightedRandomSampler(lab_w, big, replacement=True)))
+    unl_it = _cycle(mk(unl_set, torch.utils.data.RandomSampler(unl_set, replacement=True, num_samples=big)))
+
+    student, prov = Net(ARCH_SPECS[spec["arch"]]["ctor"](None)), sup_run["provenance"]
+    student.load_state_dict(_load_half(Path(sup_run["ckpt"])))
+    student.to(DEVICE)
+    ema = EMA(student, 0.99)
+    micro = max(1, probe_micro_batch(student, S, bs) // 2)
+    crit = SegLoss(spec["loss"], class_weights_from(tr_recs, CFG["class_weight_cap"]), CFG["label_smoothing"]).to(DEVICE)
+    opt = torch.optim.AdamW([{"params": student.encoder_params(), "lr": spec["lr_encoder"] * 0.25}, {"params": student.other_params(), "lr": spec["lr_decoder"] * 0.25}],
+                            weight_decay=CFG["weight_decay"])
+    total = spec["epochs"] * spec["ssl_steps"]
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda st: lr_factor(st, int(0.05 * total), total, 0.05))
+    scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
+    base = evaluate_models([ema.module], val_items, "none")[0].metrics()
+    hist, t0, step = [], time.time(), 0
+    lsup = lunl = 0.0
+    for epoch in range(spec["epochs"]):
+        if not BUDGET.ok(60):
+            break
+        student.train()
+        for _ in range(spec["ssl_steps"]):
+            xl, yl = next(lab_it); xu, mu = next(unl_it)
+            xl, yl, xu, mu = xl.to(DEVICE), yl.to(DEVICE), xu.to(DEVICE), mu.to(DEVICE)
+            opt.zero_grad(set_to_none=True)
+            for xc, yc in zip(xl.split(micro), yl.split(micro)):
+                with AUTOCAST():
+                    lg = student(xc)
+                ls = crit(lg.float(), yc) * len(xc) / len(xl)
+                scaler.scale(ls).backward(); lsup += float(ls)
+            keep = mu != 4
+            plb = torch.where(keep, mu, torch.zeros_like(mu))
+            xs, pl2, keep2 = cutmix(strong_photometric(xu), plb, keep)
+            tgt = torch.where(keep2, pl2, torch.full_like(pl2, IGNORE))
+            w_u = spec["lambda_u"] * rampup(step / max(1.0, 0.3 * total))
+            for xc, tc in zip(xs.split(micro), tgt.split(micro)):
+                if int((tc != IGNORE).sum()) < 32:
+                    continue
+                with AUTOCAST():
+                    lg = student(xc)
+                lu = F.cross_entropy(lg.float(), tc, ignore_index=IGNORE) * (len(xc) / len(xs)) * w_u
+                scaler.scale(lu).backward(); lunl += float(lu)
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(student.parameters(), CFG["grad_clip"])
+            scaler.step(opt); scaler.update(); sched.step(); ema.update(student)
+            step += 1
+        vm = evaluate_models([ema.module], val_items, "none")[0].metrics()
+        hist.append(dict(epoch=epoch, loss_sup=lsup / spec["ssl_steps"], loss_unl=lunl / spec["ssl_steps"], val_macro_fg_dice=vm["macro_fg_dice"], val_micro_fg_dice=vm["micro_fg_dice"],
+                         val_dice_fibrin=vm["dice_fibrin"], val_dice_granulation=vm["dice_granulation"], val_dice_callus=vm["dice_callus"], val_macro_fg_iou=vm["macro_fg_iou"],
+                         val_paper_dice=vm["paper_dice"], w_u=w_u))
+        lsup = lunl = 0.0
+    _save_half(ema.module.state_dict(), rdir / "best.pt")       # sem seleção de época: EMA final
+    final = Net(ARCH_SPECS[spec["arch"]]["ctor"](None)).to(DEVICE)
+    final.load_state_dict(_load_half(rdir / "best.pt"))
+    vfin = evaluate_models([final], val_items, "none")[0].metrics()
+    result = dict(spec=spec, run_id=rid, status="finished", best_epoch=len(hist) - 1, epochs_run=len(hist), val=vfin, val_names=[r["name"] for r in va_recs], val_before=base,
+                  improved=(vfin["macro_fg_dice"] or 0) > (base["macro_fg_dice"] or 0) + 1e-4, history=hist, provenance=prov, params_M=round(count_params(student), 2), micro_batch=micro,
+                  train_seconds=round(time.time() - t0, 1), ckpt=str(rdir / "best.pt"), device=HW["gpu_name"] or "cpu",
+                  pseudo_label_stats=dict(tau=pl.tau.tolist(), kept=pl.kept.tolist(), share=pl.share.tolist(), n_teachers=pl.n_teachers))
+    rf.write_text(json.dumps(result, indent=1, default=float))
+    del student, ema, opt, final
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
+    return result
+
+
+if CFG["do_ssl"] and CFG["ssl_ens"] and len(UNL) > 0 and BUDGET.ok(1800):
+    ens_archs = RANKED_ARCHS[:CFG["ssl_archs_top"]]
+    unl_recs_e = load_unlabeled_records(CFG["frame"])
+    items_e = _unlabeled_canvas_items(unl_recs_e, SIZE)
+    print(f"SSL com professor ensemble por fold | alunos: {ens_archs} | {len(items_e)} imagens sem anotação | TTA do professor: {CFG['ssl_ens_tta']}")
+    for arch in ens_archs:
+        new = []
+        for rid in VARIANTS[f"sup:{arch}"]:
+            if not BUDGET.ok(900):
+                break
+            run = POOL[rid]["run"]
+            pl = fold_pseudo_labels(run["spec"].get("fold"), items_e)
+            r = train_ssl_ens_round(run, items_e, pl)
+            new.append(r)
+            SSL_RESULTS.append(r)
+            register_member(r, "ssle")
+        if new:
+            gains = [val_score(r) - r["val_before"]["macro_fg_dice"] for r in new]
+            print(f"  {arch} ssle: Δ macro-Dice médio no fold retido = {np.mean(gains):+.4f} (por membro: {[round(g, 3) for g in gains]}) | professores/fold: {new[-1]['pseudo_label_stats']['n_teachers']}"
+                  f" | fração retida por classe (último fold): {[round(x, 2) for x in new[-1]['pseudo_label_stats']['kept']]}")
+    ALL_RESULTS += [r for r in SSL_RESULTS if r["spec"]["exp"] == "ssle"]
+
 # %%
 if SSL_RESULTS:
     rows = [dict(run=r["run_id"], ronda=r["spec"]["exp"], antes=r["val_before"]["macro_fg_dice"], depois=r["val"]["macro_fg_dice"],
@@ -264,7 +432,10 @@ if SSL_VARIANTS:
         sup_v = f"sup:{v.split(':', 1)[1]}"
         if sup_v in OOF_SUP:
             pairs.append((f"{v} vs {sup_v}", OOF_SSL[v], OOF_SUP[sup_v]))
-        prev = f"ssl{int(v[3:v.index(':')]) - 1}:{v.split(':', 1)[1]}" if v.startswith("ssl") and int(v[3:v.index(':')]) > 0 else None
+        m_r = re.match(r"ssl(\d+):", v)
+        prev = f"ssl{int(m_r.group(1)) - 1}:{v.split(':', 1)[1]}" if m_r and int(m_r.group(1)) > 0 else None
+        if v.startswith("ssle:") and f"ssl0:{v.split(':', 1)[1]}" in OOF_SSL:      # professor ensemble vs SSL EMA da mesma arquitetura
+            pairs.append((f"{v} vs ssl0:{v.split(':', 1)[1]}", OOF_SSL[v], OOF_SSL[f"ssl0:{v.split(':', 1)[1]}"]))
         if prev in OOF_SSL:
             pairs.append((f"{v} vs {prev}", OOF_SSL[v], OOF_SSL[prev]))
     SSL_PAIRED = paired_table(pairs)

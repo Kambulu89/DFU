@@ -152,6 +152,15 @@ class SegSet(torch.utils.data.Dataset):
         return 1.0 + boost * np.clip(fr / max(fr.mean(), 1e-6), 0, 2.0)
 
 
+class CanvasSegSet(SegSet):
+    """Como `SegSet`, mas os itens já estão na tela do modelo (imagem uint8 SxSx3, máscara uint8 SxS, validade SxS): usado para *pseudo-labels* pré-calculadas,
+    que vivem em coordenadas da tela e têm de sofrer exatamente a mesma augmentation geométrica da imagem (nearest)."""
+
+    def __init__(self, items: list[dict], aug: str = "weak"):
+        self.items = items
+        self.aug, self.labeled, self._rng = Augmenter(aug), True, None
+
+
 class EvalItems:
     """Itens de avaliação: tela de entrada (sem augmentation) + geometria + GT no frame de avaliação (tamanho do conteúdo)."""
 
