@@ -196,7 +196,7 @@ def train_ssl_round(sup_run: dict, init_ckpt: str, round_idx: int, unl_recs: lis
 
 
 SSL_RESULTS: list[dict] = []
-if CFG["do_ssl"] and len(UNL) > 0 and BUDGET.ok(1800):
+if CFG["do_ssl"] and CFG["ssl_ema"] and len(UNL) > 0 and BUDGET.ok(1800):
     ssl_archs = RANKED_ARCHS[:CFG["ssl_archs_top"]]
     unl_recs = load_unlabeled_records(CFG["frame"])
     print(f"SSL sobre {ssl_archs} (todos os membros/folds de cada uma) | {len(unl_recs)} imagens sem anotação (após filtro anti-fuga) | seleção: {CFG['ssl_select']} | rondas: {CFG['ssl_rounds']}")
@@ -222,6 +222,8 @@ if CFG["do_ssl"] and len(UNL) > 0 and BUDGET.ok(1800):
     ALL_RESULTS += SSL_RESULTS
 elif not CFG["do_ssl"]:
     print("SSL desativado na configuração.")
+elif not CFG["ssl_ema"]:
+    print("SSL EMA (professor = EMA do próprio aluno) desligado na configuração; usa-se só o SSL com professor ensemble.")
 else:
     print("SSL OMITIDO: sem imagens não anotadas utilizáveis (ou sem orçamento de tempo). O notebook continua em modo supervisionado.")
 
@@ -253,12 +255,19 @@ def _unlabeled_canvas_items(unl_recs: list[dict], S: int) -> list[dict]:
 _PL_CACHE: dict = {}
 
 
+def ens_kind(gen: int) -> str:
+    return "ssle" if gen == 1 else f"ssle{gen}"
+
+
 @torch.no_grad()
-def fold_pseudo_labels(fold, items: list[dict]) -> _Packed:
-    if fold in _PL_CACHE:
-        return _PL_CACHE[fold]
-    teachers = [rid for rid, e in POOL.items() if e["kind"] == "sup" and e["fold"] == fold]
-    assert teachers, f"Sem modelos supervisionados para o fold {fold}"
+def fold_pseudo_labels(fold, items: list[dict], gen: int = 1) -> _Packed:
+    """Pseudo-labels do fold `fold` na geração `gen`: professor = ensemble (com TTA) dos modelos DESSE fold — supervisionados e, na geração g>1, também os alunos das gerações anteriores.
+    Todos eles treinaram sem as imagens retidas do fold, logo o OOF não tem fuga."""
+    if (fold, gen) in _PL_CACHE:
+        return _PL_CACHE[(fold, gen)]
+    kinds = {"sup"} | {ens_kind(g) for g in range(1, gen)}
+    teachers = [rid for rid, e in POOL.items() if e["kind"] in kinds and e["fold"] == fold]
+    assert teachers, f"Sem modelos professores para o fold {fold}"
     models = [load_pool_model(r) for r in teachers]
     pl_all, conf_all = [], []
     for i in range(0, len(items), 8):
@@ -280,12 +289,12 @@ def fold_pseudo_labels(fold, items: list[dict]) -> _Packed:
     packed = np.where(keep, pl, 4).astype(np.uint8)
     kept = np.array([(keep & (pl == c)).sum() / max((pl == c).sum(), 1) for c in range(K)])
     share = np.array([(pl == c).mean() for c in range(K)])
-    _PL_CACHE[fold] = _Packed(packed, tau, kept, share, len(teachers))
-    return _PL_CACHE[fold]
+    _PL_CACHE[(fold, gen)] = _Packed(packed, tau, kept, share, len(teachers))
+    return _PL_CACHE[(fold, gen)]
 
 
-def train_ssl_ens_round(sup_run: dict, items: list[dict], pl: _Packed) -> dict:
-    spec = dict(sup_run["spec"]) | dict(exp="ssle", epochs=CFG["ssl_epochs"], init=sup_run["ckpt"], keep_frac=CFG["ssl_keep_frac"], tau=[CFG["ssl_tau_min"], CFG["ssl_tau_max"]],
+def train_ssl_ens_round(sup_run: dict, items: list[dict], pl: _Packed, gen: int = 1) -> dict:
+    spec = dict(sup_run["spec"]) | dict(exp=ens_kind(gen), gen=gen, epochs=CFG["ssl_epochs"], init=sup_run["ckpt"], keep_frac=CFG["ssl_keep_frac"], tau=[CFG["ssl_tau_min"], CFG["ssl_tau_max"]],
                 lambda_u=CFG["ssl_lambda_u"], ssl_steps=CFG["ssl_steps_per_epoch"], n_unl=len(items), ssl_select="last", teacher="ensemble_same_fold")
     rid = run_id_of(spec)
     rdir = DIRS["runs"] / rid
@@ -375,23 +384,28 @@ if CFG["do_ssl"] and CFG["ssl_ens"] and len(UNL) > 0 and BUDGET.ok(1800):
     ens_archs = RANKED_ARCHS[:CFG["ssl_archs_top"]]
     unl_recs_e = load_unlabeled_records(CFG["frame"])
     items_e = _unlabeled_canvas_items(unl_recs_e, SIZE)
-    print(f"SSL com professor ensemble por fold | alunos: {ens_archs} | {len(items_e)} imagens sem anotação | TTA do professor: {CFG['ssl_ens_tta']}")
-    for arch in ens_archs:
-        new = []
-        for rid in VARIANTS[f"sup:{arch}"]:
-            if not BUDGET.ok(900):
-                break
-            run = POOL[rid]["run"]
-            pl = fold_pseudo_labels(run["spec"].get("fold"), items_e)
-            r = train_ssl_ens_round(run, items_e, pl)
-            new.append(r)
-            SSL_RESULTS.append(r)
-            register_member(r, "ssle")
-        if new:
-            gains = [val_score(r) - r["val_before"]["macro_fg_dice"] for r in new]
-            print(f"  {arch} ssle: Δ macro-Dice médio no fold retido = {np.mean(gains):+.4f} (por membro: {[round(g, 3) for g in gains]}) | professores/fold: {new[-1]['pseudo_label_stats']['n_teachers']}"
-                  f" | fração retida por classe (último fold): {[round(x, 2) for x in new[-1]['pseudo_label_stats']['kept']]}")
-    ALL_RESULTS += [r for r in SSL_RESULTS if r["spec"]["exp"] == "ssle"]
+    print(f"SSL com professor ensemble por fold | alunos: {ens_archs} | gerações: {CFG['ssl_ens_gens']} | {len(items_e)} imagens sem anotação | TTA do professor: {CFG['ssl_ens_tta']}")
+    for gen in range(1, CFG["ssl_ens_gens"] + 1):
+        for arch in ens_archs:
+            new = []
+            for rid in VARIANTS[f"sup:{arch}"]:
+                if not BUDGET.ok(900):
+                    break
+                run = POOL[rid]["run"]
+                pl = fold_pseudo_labels(run["spec"].get("fold"), items_e, gen)
+                r = train_ssl_ens_round(run, items_e, pl, gen)      # o aluno parte SEMPRE do modelo supervisionado do fold (evita acumular erros entre gerações)
+                new.append(r)
+                SSL_RESULTS.append(r)
+                register_member(r, ens_kind(gen))
+            if new:
+                gains = [val_score(r) - r["val_before"]["macro_fg_dice"] for r in new]
+                print(f"  geração {gen} | {arch}: Δ macro-Dice médio no fold retido = {np.mean(gains):+.4f} (por membro: {[round(g, 3) for g in gains]}) | professores/fold: {new[-1]['pseudo_label_stats']['n_teachers']}"
+                      f" | fração retida por classe (último fold): {[round(x, 2) for x in new[-1]['pseudo_label_stats']['kept']]}")
+            if len(new) < len(VARIANTS[f"sup:{arch}"]):
+                print(f"  geração {gen} | {arch} incompleta ({len(new)} membros): variante será descartada por cobertura.")
+        if not BUDGET.ok(1800):
+            print("Orçamento de tempo: a parar gerações SSL."); break
+    ALL_RESULTS += [r for r in SSL_RESULTS if r["spec"]["exp"].startswith("ssle")]
 
 # %%
 if SSL_RESULTS:
@@ -402,19 +416,21 @@ if SSL_RESULTS:
     SSL_TABLE.to_csv(DIRS["tables"] / "ssl_before_after_val.csv", index=False)
     print("Antes vs depois do SSL (VALIDAÇÃO):")
     display(SSL_TABLE.round(4))
-    r = SSL_RESULTS[0]
+    r = next((x for x in SSL_RESULTS if "kept_background" in x["history"][0]), SSL_RESULTS[0])
     h = pd.DataFrame(r["history"])
-    fig, ax = plt.subplots(1, 4, figsize=(18, 3.4))
-    ax[0].plot(h.epoch, h.loss_sup, label="supervisionada"); ax[0].plot(h.epoch, h.loss_unl, label="não supervisionada (ponderada)"); ax[0].legend(); ax[0].set_title("Perdas SSL (ronda 0)")
+    has_kept = "kept_background" in h
+    fig, ax = plt.subplots(1, 4 if has_kept else 2, figsize=(18 if has_kept else 9, 3.4))
+    ax[0].plot(h.epoch, h.loss_sup, label="supervisionada"); ax[0].plot(h.epoch, h.loss_unl, label="não supervisionada (ponderada)"); ax[0].legend(); ax[0].set_title(f"Perdas SSL ({r['spec']['exp']})")
     for c in ["macro_fg_dice", "dice_fibrin", "dice_granulation", "dice_callus"]:
         ax[1].plot(h.epoch, h[f"val_{c}"], label=c)
-    ax[1].axhline(r["val_before"]["macro_fg_dice"], color="k", ls=":", label="macro antes do SSL"); ax[1].legend(fontsize=7); ax[1].set_title("Dice de validação (teacher)")
-    for c in CLASS_NAMES:
-        ax[2].plot(h.epoch, h[f"kept_{c.lower()}"], label=c)
-    ax[2].set_title("Fração de píxeis retidos por classe"); ax[2].legend(fontsize=7)
-    for c in CLASS_NAMES:
-        ax[3].plot(h.epoch, h[f"share_{c.lower()}"], label=c)
-    ax[3].set_title("Proporção prevista por classe nos não anotados\n(deriva = sinal de viés de confirmação)"); ax[3].set_yscale("log"); ax[3].legend(fontsize=7)
+    ax[1].axhline(r["val_before"]["macro_fg_dice"], color="k", ls=":", label="macro antes do SSL"); ax[1].legend(fontsize=7); ax[1].set_title("Dice de validação (modelo avaliado)")
+    if has_kept:
+        for c in CLASS_NAMES:
+            ax[2].plot(h.epoch, h[f"kept_{c.lower()}"], label=c)
+        ax[2].set_title("Fração de píxeis retidos por classe"); ax[2].legend(fontsize=7)
+        for c in CLASS_NAMES:
+            ax[3].plot(h.epoch, h[f"share_{c.lower()}"], label=c)
+        ax[3].set_title("Proporção prevista por classe nos não anotados\n(deriva = sinal de viés de confirmação)"); ax[3].set_yscale("log"); ax[3].legend(fontsize=7)
     fig.tight_layout(); savefig(fig, "ssl_diagnostics.png"); plt.show()
 
 # %% [markdown]
@@ -434,6 +450,12 @@ if SSL_VARIANTS:
             pairs.append((f"{v} vs {sup_v}", OOF_SSL[v], OOF_SUP[sup_v]))
         m_r = re.match(r"ssl(\d+):", v)
         prev = f"ssl{int(m_r.group(1)) - 1}:{v.split(':', 1)[1]}" if m_r and int(m_r.group(1)) > 0 else None
+        m_e = re.match(r"ssle(\d+):", v)
+        if m_e and int(m_e.group(1)) > 1:       # geração g vs geração g-1 do professor ensemble
+            g_prev = int(m_e.group(1)) - 1
+            pv = f"ssle{'' if g_prev == 1 else g_prev}:{v.split(':', 1)[1]}"
+            if pv in OOF_SSL:
+                pairs.append((f"{v} vs {pv}", OOF_SSL[v], OOF_SSL[pv]))
         if v.startswith("ssle:") and f"ssl0:{v.split(':', 1)[1]}" in OOF_SSL:      # professor ensemble vs SSL EMA da mesma arquitetura
             pairs.append((f"{v} vs ssl0:{v.split(':', 1)[1]}", OOF_SSL[v], OOF_SSL[f"ssl0:{v.split(':', 1)[1]}"]))
         if prev in OOF_SSL:

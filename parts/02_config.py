@@ -33,8 +33,10 @@ _BASE = dict(
     ssl_tau_min=0.75, ssl_tau_max=0.97, ssl_dup_hamming=8,
     ssl_select="best",      # 'best': melhor época na validação (com rollback) | 'last': pesos finais, sem seleção (avaliação não enviesada)
     ssl_archs_top=1,        # nº de arquiteturas (melhores no OOF/val) a que se aplica SSL; todos os seus modelos/folds são usados
+    ssl_ema=True,           # SSL EMA online (professor = EMA do próprio aluno): ~19 min por modelo em T4; o `ssle` dá o mesmo ou mais e custa menos
     ssl_ens=False,          # SSL com professor ENSEMBLE limpo por fold (pseudo-labels offline do ensemble de todas as arquiteturas do mesmo fold, que não viram as imagens retidas)
     ssl_ens_tta="flip",
+    ssl_ens_gens=1,         # gerações: g=2 usa como professor o ensemble {supervisionados + alunos da geração 1} do mesmo fold; o aluno parte sempre do supervisionado
     # inferência / estatística
     tta_candidates=["none", "flip", "flip_ms"], pp_min_area_fracs=[0.0, 0.0005, 0.001, 0.002, 0.005],
     pp_fibrin_fracs=[0.0, 0.001, 0.002, 0.005, 0.01], pp_scale_grid=[0.6, 0.8, 1.0, 1.25, 1.6], tune_class_scale=True, pp_gain_margin=0.002,
@@ -43,15 +45,17 @@ _BASE = dict(
 _MODES = {
     "smoke": dict(archs=["smoke_fpn_r18"], seeds=[0], epochs=3, patience=3, warmup_epochs=1, freeze_epochs=1, batch_size=8,
                   ssl_rounds=1, ssl_epochs=2, ssl_steps_per_epoch=3, bootstrap_b=100, paired_bootstrap_b=50, do_lr_range=True, num_workers=0,
-                  do_cv=True, cv_folds=2, ssl_select="last", pp_scale_grid=[0.8, 1.0, 1.25], ssl_ens=True,
+                  do_cv=True, cv_folds=2, ssl_select="last", pp_scale_grid=[0.8, 1.0, 1.25], ssl_ens=True, ssl_ens_gens=2,
                   do_probes=True, probe_epochs=1, probe_frames=[("padded", 256), ("roi", 256)],
                   probe_losses=["ce_dice", "focal_tversky"], do_ablation=True, ablation_epochs=1, time_budget_hours=2.0),
     "quick": dict(archs=["unetpp_effb4", "segformer_mitb3"], seeds=[42], epochs=60, patience=20, ssl_rounds=1, ssl_epochs=30,
                   bootstrap_b=1000, time_budget_hours=4.0),
     # `full`: arquiteturas por ordem de prioridade (se o tempo acabar, as primeiras ficam com todos os folds). A EfficientNet-B4 foi retirada (pior por ~4 pp, IC robusto, na corrida anterior);
     # frame/resolução fixados em roi/384 e sondas desligadas (a corrida anterior deu empate entre perdas e 384>512). Ligue-as com DFU_CFG_OVERRIDE se quiser re-verificar.
-    "full": dict(archs=["upernet_convnext_s", "segformer_mitb3", "upernet_convnext_b", "segformer_mitb5"], seeds=[42], size=384, do_probes=False, do_ablation=False, do_cv=True,
-                 ssl_select="last", ssl_archs_top=2, ssl_rounds=1, ssl_epochs=30, ssl_ens=True, time_budget_hours=10.5),
+    # Corrida anterior (OOF, 94 imagens): ConvNeXt-B e MiT-B5 não melhoraram (B5 pior, IC robusto) -> retirados; SSL EMA custou 3,1 h e o `ssle` igualou-o ou superou-o -> desligado;
+    # o Dice do SSL estabiliza por volta da época 10 -> 20 épocas bastam; geração 2 do professor ensemble usa o tempo libertado.
+    "full": dict(archs=["upernet_convnext_s", "segformer_mitb3"], seeds=[42], size=384, do_probes=False, do_ablation=False, do_cv=True,
+                 ssl_select="last", ssl_archs_top=2, ssl_ema=False, ssl_ens=True, ssl_ens_gens=2, ssl_epochs=20, time_budget_hours=10.5),
 }
 assert MODE in _MODES, f"MODE inválido: {MODE}"
 CFG = {**_BASE, **_MODES[MODE], "mode": MODE}
