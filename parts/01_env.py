@@ -10,6 +10,7 @@ import os, re, sys, platform, subprocess, importlib, json, time, math, random, s
 from pathlib import Path
 from collections import OrderedDict, defaultdict
 
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")   # necessário para cuBLAS determinístico (tem de ser definido antes de criar o contexto CUDA)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 IS_KAGGLE = Path("/kaggle/input").exists()

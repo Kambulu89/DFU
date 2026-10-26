@@ -75,7 +75,7 @@ def predict_probs(models: list[nn.Module], items: EvalItems, tta: str = "none", 
     return out
 
 
-DEFAULT_PP = dict(scale=[1.0, 1.0, 1.0, 1.0], min_frac=0.0, fibrin_frac=0.0)
+DEFAULT_PP = dict(scale=[1.0, 1.0, 1.0, 1.0], min_frac=0.0, fibrin_frac=0.0, fibrin_conf=0.0)
 
 
 def norm_pp(pp) -> dict:
@@ -87,19 +87,22 @@ def norm_pp(pp) -> dict:
     return {**DEFAULT_PP, **pp}
 
 
-def remove_small_components(pred: np.ndarray, pp) -> np.ndarray:
+def remove_small_components(pred: np.ndarray, pp, probs: np.ndarray | None = None) -> np.ndarray:
     """Remove componentes conexas de tecido abaixo de uma fração da área da imagem (global `min_frac`; a fibrina usa o maior de `min_frac` e `fibrin_frac`).
     O rótulo de substituição é a moda dos vizinhos (ou fundo)."""
     pp = norm_pp(pp)
     out = pred.copy()
     for c in TISSUES:
         frac = max(pp["min_frac"], pp["fibrin_frac"] if c == 1 else 0.0)
-        if frac <= 0:
+        use_conf = c == 1 and pp["fibrin_conf"] > 0 and probs is not None      # filtro de confiança: componentes de fibrina com probabilidade média baixa são removidos
+        if frac <= 0 and not use_conf:
             continue
         thr = frac * pred.size
         n, lab, stats, _ = cv2.connectedComponentsWithStats((out == c).astype(np.uint8), connectivity=8)
         for comp in range(1, n):
-            if stats[comp, cv2.CC_STAT_AREA] < thr:
+            small = stats[comp, cv2.CC_STAT_AREA] < thr
+            weak = use_conf and float(probs[1][lab == comp].mean()) < pp["fibrin_conf"]
+            if small or weak:
                 region = lab == comp
                 ring = cv2.dilate(region.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=2).astype(bool) & ~region
                 vals = out[ring & (out != c)]
@@ -111,7 +114,28 @@ def probs_to_preds(probs: list[np.ndarray], pp=0.0) -> list[np.ndarray]:
     """Escala as probabilidades por classe (a priori ajustável), faz argmax e remove componentes pequenas. `pp` como em `norm_pp`."""
     pp = norm_pp(pp)
     sc = np.asarray(pp["scale"], np.float32)[:, None, None]
-    return [remove_small_components((p * sc).argmax(0).astype(np.uint8), pp) for p in probs]
+    return [remove_small_components((p * sc).argmax(0).astype(np.uint8), pp, p) for p in probs]
+
+
+def _pp_selftest() -> None:
+    """Filtro de confiança da fibrina: remove só o componente de baixa confiança; área mínima e escala por classe comportam-se como esperado."""
+    pred = np.zeros((40, 40), np.uint8)
+    pred[2:12, 2:12] = 1      # componente de fibrina A (alta confiança)
+    pred[25:35, 25:35] = 1    # componente de fibrina B (baixa confiança)
+    pred[15:22, 15:30] = 2
+    probs = np.zeros((K, 40, 40), np.float32)
+    probs[0] = 0.5
+    probs[1][2:12, 2:12] = 0.9; probs[1][25:35, 25:35] = 0.4
+    out = remove_small_components(pred, dict(fibrin_conf=0.6), probs)
+    assert (out[2:12, 2:12] == 1).all() and (out[25:35, 25:35] != 1).all() and (out[15:22, 15:30] == 2).all()
+    assert (remove_small_components(pred, dict(fibrin_conf=0.0), probs) == pred).all()          # desligado -> inalterado
+    assert (remove_small_components(pred, dict(fibrin_frac=0.2)) [2:12, 2:12] != 1).all()      # área mínima: 100 px < 0,2*1600
+    sc = probs_to_preds([np.stack([np.full((8, 8), 0.4), np.full((8, 8), 0.35), np.full((8, 8), 0.25), np.zeros((8, 8))]).astype(np.float32)], dict(scale=[1, 1.5, 1, 1]))[0]
+    assert (sc == 1).all()    # a escala 1,5 inverte o argmax de fundo (0,4) para fibrina (0,525)
+    print("OK: testes do pós-processamento (confiança de fibrina, área mínima, escala por classe)")
+
+
+_pp_selftest()
 
 
 def evaluate_models(models, items: EvalItems, tta: str = "none", weights=None, pp=0.0):

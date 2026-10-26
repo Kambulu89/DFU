@@ -108,7 +108,7 @@ def dev_score(probs, pp=0.0, idx=None) -> float:
 
 
 def tune_postproc(probs: list[np.ndarray], idx=None) -> tuple[dict, float, float]:
-    """Ajusta, SÓ no conjunto de desenvolvimento (OOF), (1) escala de probabilidade por classe (a priori), (2) área mínima global e (3) área mínima da fibrina,
+    """Ajusta, SÓ no conjunto de desenvolvimento (OOF), (1) escala de probabilidade por classe (a priori), (2) área mínima global e (3) área mínima da fibrina e (4) confiança mínima dos componentes de fibrina,
     por ascensão de coordenadas; cada passo só é aceite se ganhar > `pp_gain_margin` (histerese contra sobreajuste). Devolve (pp, score_base, score_final)."""
     margin = CFG["pp_gain_margin"]
     pp = norm_pp(None)
@@ -123,7 +123,7 @@ def tune_postproc(probs: list[np.ndarray], idx=None) -> tuple[dict, float, float
                     sc = dev_score(probs, cand, idx)
                     if sc > best + margin:
                         pp, best = cand, sc
-    for key, grid in [("min_frac", CFG["pp_min_area_fracs"]), ("fibrin_frac", CFG["pp_fibrin_fracs"])]:
+    for key, grid in [("min_frac", CFG["pp_min_area_fracs"]), ("fibrin_frac", CFG["pp_fibrin_fracs"]), ("fibrin_conf", CFG["pp_fibrin_conf"])]:
         for g in grid:
             if g == pp[key]:
                 continue

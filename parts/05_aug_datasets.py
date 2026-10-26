@@ -135,7 +135,7 @@ class SegSet(torch.utils.data.Dataset):
 
     def _get_rng(self) -> np.random.Generator:
         if self._rng is None:
-            self._rng = np.random.default_rng((torch.initial_seed() + os.getpid()) % (2**32))
+            self._rng = np.random.default_rng(torch.initial_seed() % (2**32))   # sem PID: reprodutível (o PyTorch já dá uma semente distinta a cada worker)
         return self._rng
 
     def __getitem__(self, i: int):

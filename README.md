@@ -25,7 +25,7 @@ Este diretório é de investigação e é independente da plataforma de gestão 
 2. Ative a GPU (T4/P100). Com **Internet ligada**, o notebook instala `segmentation-models-pytorch` e descarrega pesos pré-treinados. Com **Internet desligada**, adicione
    datasets com o *wheel* de `segmentation_models_pytorch` e com os pesos (ficheiros `.pth/.pt/.bin/.safetensors` cujo nome/pasta contenha `efficientnet_b4`,
    `convnext_small` ou `mit_b3`). Sem pesos, treina-se com inicialização aleatória e isso fica registado (`weights_provenance.json`) — não é *transfer learning*.
-3. Na célula de configuração escolha `MODE`: `quick` (primeira corrida, divisão oficial, 2 arquiteturas × 1 semente) ou `full` (validação cruzada de 5 folds nas 94 imagens de desenvolvimento com 2 arquiteturas (ConvNeXt-S e SegFormer MiT-B3 — ConvNeXt-B e MiT-B5 não melhoraram no OOF e estão disponíveis mas fora do `full`), *frame*/resolução fixos em `roi`/384, SSL com professor *ensemble* por fold em 2 gerações (o SSL EMA, mais caro e sem vantagem, fica desligado por omissão: `ssl_ema=true` volta a ligá-lo), TTA, pós-processamento só se o ganho "honesto" for positivo e bootstrap pareado; sondas e ablação desligadas por omissão — `DFU_CFG_OVERRIDE='{"do_probes":true,"do_ablation":true}'` volta a ligá-las). O `full` leva horas em T4: o orçamento (`time_budget_hours`) interrompe de forma ordenada e descarta variantes incompletas.
+3. Na célula de configuração escolha `MODE`: `quick` (primeira corrida, divisão oficial, 2 arquiteturas × 1 semente) ou `full` (validação cruzada de 5 folds nas 94 imagens de desenvolvimento com 2 arquiteturas (ConvNeXt-S e SegFormer MiT-B3 — ConvNeXt-B e MiT-B5 não melhoraram no OOF e estão disponíveis mas fora do `full`), *frame*/resolução fixos em `roi`/384, 2 sementes e SSL com professor *ensemble* por fold (1 geração; `ssl_ens_gens=2` disponível) (o SSL EMA, mais caro e sem vantagem, fica desligado por omissão: `ssl_ema=true` volta a ligá-lo), TTA, pós-processamento só se o ganho "honesto" for positivo e bootstrap pareado; sondas e ablação desligadas por omissão — `DFU_CFG_OVERRIDE='{"do_probes":true,"do_ablation":true}'` volta a ligá-las). O `full` leva horas em T4: o orçamento (`time_budget_hours`) interrompe de forma ordenada e descarta variantes incompletas.
    Variáveis opcionais: `DFU_MODE`, `DFU_DATA_ROOT`, `DFU_ALLOW_DOWNLOAD=0` (desliga o clone automático do repositório dos autores, que por omissão ocorre se não houver dataset anexado e a Internet estiver ligada), `DFU_CFG_OVERRIDE` (JSON).
 4. Execute tudo. As execuções são idempotentes (`runs/*/result.json`): se a sessão cair, volte a correr e o que já terminou é reutilizado (treinos longos retomam de `last.pt`).
 
@@ -42,3 +42,9 @@ Este diretório é de investigação e é independente da plataforma de gestão 
 
 A origem de cada execução fica em `weights_provenance.json`. Os pesos MiT-B3 (NVlabs SegFormer) têm licença da NVIDIA de uso não comercial; confirme nos *model cards* a licença dos
 restantes pesos antes de reutilizar. O dataset DFUTissue tem os seus próprios termos (ver `Citation.txt` no repositório dos autores); cite o artigo.
+
+## Reprodutibilidade
+
+Corrigido na 3.ª versão: a *augmentation* deixou de usar o PID do processo na semente e o treino usa `torch.use_deterministic_algorithms(True, warn_only=True)` (`deterministic` em `CFG`).
+Duas execuções `smoke` independentes dão resultados idênticos de ponta a ponta. Em GPU, alguns *kernels* CUDA continuam a ter pequena variação numérica; antes desta correção, com a mesma
+semente, o OOF de uma arquitetura variou ~1 pp entre corridas — por isso diferenças de ~1 pp entre arquiteturas não devem ser lidas como reais sem o bootstrap pareado.

@@ -39,7 +39,7 @@ _BASE = dict(
     ssl_ens_gens=1,         # gerações: g=2 usa como professor o ensemble {supervisionados + alunos da geração 1} do mesmo fold; o aluno parte sempre do supervisionado
     # inferência / estatística
     tta_candidates=["none", "flip", "flip_ms"], pp_min_area_fracs=[0.0, 0.0005, 0.001, 0.002, 0.005],
-    pp_fibrin_fracs=[0.0, 0.001, 0.002, 0.005, 0.01], pp_scale_grid=[0.6, 0.8, 1.0, 1.25, 1.6], tune_class_scale=True, pp_gain_margin=0.002,
+    pp_fibrin_fracs=[0.0, 0.001, 0.002, 0.005, 0.01], pp_scale_grid=[0.6, 0.8, 1.0, 1.25, 1.6], tune_class_scale=True, pp_gain_margin=0.002, pp_fibrin_conf=[0.0, 0.5, 0.6, 0.7, 0.8], deterministic=True,
     bootstrap_b=2000, paired_bootstrap_b=1000, time_budget_hours=9.0, resume=True, seed_base=42,
 )
 _MODES = {
@@ -53,9 +53,10 @@ _MODES = {
     # `full`: arquiteturas por ordem de prioridade (se o tempo acabar, as primeiras ficam com todos os folds). A EfficientNet-B4 foi retirada (pior por ~4 pp, IC robusto, na corrida anterior);
     # frame/resolução fixados em roi/384 e sondas desligadas (a corrida anterior deu empate entre perdas e 384>512). Ligue-as com DFU_CFG_OVERRIDE se quiser re-verificar.
     # Corrida anterior (OOF, 94 imagens): ConvNeXt-B e MiT-B5 não melhoraram (B5 pior, IC robusto) -> retirados; SSL EMA custou 3,1 h e o `ssle` igualou-o ou superou-o -> desligado;
-    # o Dice do SSL estabiliza por volta da época 10 -> 20 épocas bastam; geração 2 do professor ensemble usa o tempo libertado.
-    "full": dict(archs=["upernet_convnext_s", "segformer_mitb3"], seeds=[42], size=384, do_probes=False, do_ablation=False, do_cv=True,
-                 ssl_select="last", ssl_archs_top=2, ssl_ema=False, ssl_ens=True, ssl_ens_gens=2, ssl_epochs=20, time_budget_hours=10.5),
+    # o Dice do SSL estabiliza por volta da época 10 -> 20 épocas bastam. 2.ª corrida: a geração 2 do professor ensemble não acrescentou nada (Δ≈0, indistinguível) e custou 175 min ->
+    # volta a 1 geração, e o tempo vai para uma 2.ª semente (mais membros no ensemble; o OOF faz a média dos membros que não viram cada imagem).
+    "full": dict(archs=["upernet_convnext_s", "segformer_mitb3"], seeds=[42, 43], size=384, do_probes=False, do_ablation=False, do_cv=True,
+                 ssl_select="last", ssl_archs_top=2, ssl_ema=False, ssl_ens=True, ssl_ens_gens=1, ssl_epochs=20, time_budget_hours=10.5),
 }
 assert MODE in _MODES, f"MODE inválido: {MODE}"
 CFG = {**_BASE, **_MODES[MODE], "mode": MODE}
@@ -107,6 +108,8 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+    if CFG.get("deterministic", True):
+        torch.use_deterministic_algorithms(True, warn_only=True)   # operações sem versão determinística só avisam (avisos silenciados)
 
 
 seed_everything(CFG["seed_base"])
