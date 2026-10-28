@@ -50,15 +50,19 @@ def find_wheels(stem: str, max_depth: int = 4) -> list[Path]:
     return out
 
 
-def ensure_package(import_name: str, pip_name: str | None = None, min_version: str | None = None) -> None:
+def ensure_package(import_name: str, pip_name: str | None = None, min_version: str | None = None, max_version: str | None = None) -> None:
+    """Garante `min_version <= versão < max_version` (o limite superior fixa a versão em que o notebook foi validado)."""
     pip_name = pip_name or import_name
     try:
         mod = importlib.import_module(import_name)
-        if _version_ok(getattr(mod, "__version__", "0"), min_version):
+        ver = getattr(mod, "__version__", "0")
+        if _version_ok(ver, min_version) and (max_version is None or not _version_ok(ver, max_version)):
             return
     except ImportError:
         pass
     spec = f"{pip_name}>={min_version}" if min_version else pip_name
+    if max_version:
+        spec += f",<{max_version}"
     if INTERNET:
         cmd = [sys.executable, "-m", "pip", "install", "-q", spec]
     else:
@@ -76,7 +80,7 @@ def ensure_package(import_name: str, pip_name: str | None = None, min_version: s
 
 
 ensure_package("packaging")
-ensure_package("segmentation_models_pytorch", "segmentation-models-pytorch", "0.5.0")  # UPerNet/Segformer exigem >= 0.5
+ensure_package("segmentation_models_pytorch", "segmentation-models-pytorch", "0.5.0", "0.6.0")  # UPerNet/Segformer exigem >= 0.5; validado em 0.5.x (a 0.6.0 não foi validada: variação entre corridas)
 ensure_package("timm", "timm", "0.9.0")
 ensure_package("cv2", "opencv-python-headless")
 for _imp, _pip in [("pandas", "pandas"), ("matplotlib", "matplotlib"), ("scipy", "scipy"), ("tqdm", "tqdm")]:

@@ -10,7 +10,7 @@
 # Todos os hiperparâmetros vivem em `CFG`; o dicionário completo, as sementes e as versões são gravados em `config.json`.
 
 # %%
-MODE = os.environ.get("DFU_MODE", "quick")  # 'smoke' | 'quick' | 'full'
+MODE = os.environ.get("DFU_MODE", "full")  # 'smoke' | 'quick' | 'full'  — ATENÇÃO: só 'full' produz resultados comparáveis ao artigo (~5 h em T4)
 
 _BASE = dict(
     # dados
@@ -59,6 +59,9 @@ _MODES = {
                  ssl_select="last", ssl_archs_top=2, ssl_ema=False, ssl_ens=True, ssl_ens_gens=1, ssl_epochs=20, time_budget_hours=10.5),
 }
 assert MODE in _MODES, f"MODE inválido: {MODE}"
+if MODE != "full":
+    print("=" * 110 + f"\nAVISO: MODE='{MODE}'. Esta é uma execução CURTA (diagnóstico): 1 modelo por arquitetura, divisão oficial 78/16/16, sem validação cruzada, sem ensemble de folds.\n"
+          "Os resultados NÃO são comparáveis aos do modo 'full' (validação cruzada + ensemble + SSL). Para a experiência completa defina MODE = 'full' (~5 h em T4).\n" + "=" * 110)
 CFG = {**_BASE, **_MODES[MODE], "mode": MODE}
 CFG.update(json.loads(os.environ.get("DFU_CFG_OVERRIDE", "{}")))  # sobreposição opcional por variável de ambiente (JSON)
 
