@@ -186,6 +186,7 @@ report = [f"# Relatório de experiências — modo `{MODE}`", "", f"* Hardware: 
           f"* Ganho honesto do pós-processamento (ajuste numa metade, avaliação na outra): {100 * PP_HONEST_GAIN[0]:+.2f} pp ± {100 * PP_HONEST_GAIN[1]:.2f}",
           f"* Eventos de leitura do teste: {len(TEST_LEDGER)} (ver test_ledger.json)", "", "## Tabela comparativa (teste; % ; IC bootstrap 95 %)", "", md_table(COMPARISON),
           "", "## Veredicto calculado", "", VERDICT.to_string(index=False), "",
+          "## Resumo no formato curto", "", *[x for k, df in SUMMARY.items() for x in (f"**{k}**", "", md_table(df.round(3)), "")],
           "## Desempenho de desenvolvimento das variantes supervisionadas (OOF)", "", md_table(OOF_TABLE.round(4)), "",
           "## SSL vs supervisionado (OOF, bootstrap pareado)", "", md_table(SSL_PAIRED) if len(SSL_PAIRED) else "(sem SSL)", "",
           "## Comparações pareadas no teste", "", md_table(TEST_PAIRED), "",

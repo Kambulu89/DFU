@@ -195,3 +195,66 @@ if len(labels) > 2:
 TEST_PAIRED = paired_table(tp, ["macro_fg_dice", "paper_dice", "dice_fibrin", "dice_callus"])
 display(TEST_PAIRED)
 TEST_PAIRED.to_csv(DIRS["tables"] / "paired_test.csv", index=False)
+
+# %% [markdown]
+# ## 21b. Resumo no formato curto (tabelas por tecido e "Obtido vs Artigo")
+# Mesmas métricas do artigo (IoU, Precision, Recall, DSC), em %, com a diferença em pontos percentuais. **Por tecido**: valores agregados sobre as 16 imagens de teste (definição padrão).
+# **Global**: réplica do protocolo dos autores (`paper_*`), a única candidata a comparação direta (ver secção 12). "Superou" compara só as estimativas pontuais: com 16 imagens de teste
+# o intervalo de confiança é largo, por isso a mensagem final indica sempre o IC do DSC.
+
+# %%
+TISSUES_PT = [("fibrin", "Fibrin"), ("granulation", "Granulation"), ("callus", "Callus")]
+
+
+def tissue_table(m: dict) -> pd.DataFrame:
+    return pd.DataFrame([{"Tecido": nm, "IoU (%)": 100 * m[f"iou_{k}"], "Precision (%)": 100 * m[f"precision_{k}"], "Recall (%)": 100 * m[f"recall_{k}"], "DSC (%)": 100 * m[f"dice_{k}"]}
+                         for k, nm in TISSUES_PT])
+
+
+def vs_paper_table(m: dict, ref: dict) -> pd.DataFrame:
+    rows = []
+    for nm, key, rk in [("IoU", "paper_iou", "IoU"), ("Precision", "paper_precision", "Precision"), ("Recall", "paper_recall", "Recall"), ("DSC", "paper_dice", "Dice")]:
+        got = 100 * m[key]
+        rows.append({"Métrica": nm, "Obtido (%)": got, "Artigo (%)": ref[rk], "Diferença (p.p.)": got - ref[rk], "Superou": bool(got > ref[rk])})
+    return pd.DataFrame(rows)
+
+
+def pt(x: float) -> str:
+    return f"{x:.2f}".replace(".", ",")
+
+
+def show(df: pd.DataFrame) -> None:
+    with pd.option_context("display.float_format", "{:.3f}".format):
+        display(df)
+
+
+def ref_line() -> str:
+    pc = PAPER["per_class_ssl"]
+    return "Referência SSL do artigo — DSC:\n" + " | ".join(f"{nm} {pt(pc[nm]['Dice'])}%" for _, nm in TISSUES_PT)
+
+
+SUMMARY: dict[str, pd.DataFrame] = {}
+_labels = list(TEST_ROWS)
+_roles = [(_labels[0], "Supervisionado"), (_labels[-1], "Final")] if len(_labels) < 3 else [(_labels[0], "Supervisionado"), (_labels[1], "SSL"), (_labels[-1], "Final")]
+for label, role in _roles:
+    m = TEST_ROWS[label]["metrics"]
+    print(f"\n{role} — resultados por tecido  [{label}]")
+    SUMMARY[f"tecido_{role}"] = tissue_table(m)
+    show(SUMMARY[f"tecido_{role}"])
+    print(ref_line())
+
+print("\n" + "=" * 90)
+for label, role, ref_name, ref in [(_labels[0], "Supervisionado", "artigo (SL)", PAPER["supervised"]), (_labels[-1], "Final", "SSL do artigo", PAPER["semi_supervised"])]:
+    m, ci = TEST_ROWS[label]["metrics"], TEST_ROWS[label]["ci"]
+    print(f"\n{role} vs {ref_name}")
+    SUMMARY[f"vs_{role}"] = vs_paper_table(m, ref)
+    show(SUMMARY[f"vs_{role}"])
+    d = float(SUMMARY[f"vs_{role}"].loc[3, "Diferença (p.p.)"])
+    lo, hi = 100 * ci["paper_dice"][0], 100 * ci["paper_dice"][1]
+    if d < 0:
+        print(f"⚠️ O DSC ficou {pt(abs(d))} p.p. abaixo do {ref_name}. (IC 95 % do nosso DSC: [{pt(lo)}–{pt(hi)}]%; {'o IC contém o valor do artigo' if lo <= ref['Dice'] <= hi else 'o IC não contém o valor do artigo'}.)")
+    else:
+        print(f"✅ O DSC superou o {ref_name} em {pt(d)} p.p. (IC 95 % do nosso DSC: [{pt(lo)}–{pt(hi)}]%; {'o IC contém o valor do artigo: diferença não significativa' if lo <= ref['Dice'] <= hi else 'o IC exclui o valor do artigo'}.)")
+for k, df in SUMMARY.items():
+    df.to_csv(DIRS["tables"] / f"summary_{k.replace(' ', '_')}.csv", index=False)
+print("\nNota: o 'Global' usa a réplica do protocolo dos autores; a equivalência com a tabela do artigo é uma hipótese e o teste (16 imagens) é muito ruidoso.")
