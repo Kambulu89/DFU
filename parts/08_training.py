@@ -356,6 +356,43 @@ def _train_run(spec: dict, micro_bs_hint: int | None = None) -> dict:
     return result
 
 
+def find_reusable_runs() -> list[dict]:
+    """Resultados de execuções anteriores (a saída de um notebook anterior anexada como Input, ou `DFU_REUSE_RUNS`): pastas `.../dfu_run_*/runs/<id>/{result.json,best.pt}`.
+    Permite refazer só a fase final sem voltar a treinar. Cada resultado traz o seu `spec`, `val_names` e `ckpt` (reescrito para o caminho atual)."""
+    roots = [Path(os.environ["DFU_REUSE_RUNS"])] if os.environ.get("DFU_REUSE_RUNS") else []
+    if not roots and INPUT_ROOT.exists():
+        d0 = len(INPUT_ROOT.parts)
+        for dp, dn, fn in os.walk(INPUT_ROOT):
+            if len(Path(dp).parts) - d0 >= 6:
+                dn[:] = []
+            if Path(dp).name == "runs" and Path(dp).parent.name.startswith("dfu_run"):
+                roots.append(Path(dp))
+                dn[:] = []
+    found = []
+    for rd in roots:
+        for f in sorted(rd.glob("*/result.json")):
+            try:
+                r = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            ck = f.parent / "best.pt"
+            if ck.exists() and "val_names" in r:
+                r["ckpt"], r["reused_from"] = str(ck), str(f.parent)
+                found.append(r)
+    return found
+
+
+REUSED_RUNS = find_reusable_runs()
+if REUSED_RUNS:
+    print(f"Execuções anteriores reaproveitáveis encontradas: {len(REUSED_RUNS)} (de {len({r['reused_from'].rsplit('/', 3)[0] for r in REUSED_RUNS})} pasta(s)). Só se treina o que faltar.")
+
+
+def reusable(r: dict, **match) -> bool:
+    """Um resultado antigo só é reaproveitado se for compatível com a configuração atual (frame, tela, nº de folds, épocas) e com os campos pedidos."""
+    s = r["spec"]
+    return s["frame"] == CFG["frame"] and s["size"] == CFG["size"] and all(s.get(k) == v for k, v in match.items())
+
+
 def train_run(spec: dict) -> dict:
     """Treina (ou reutiliza, se já existir `result.json`) uma execução. Idempotente: permite reiniciar a sessão do notebook."""
     rid = run_id_of(spec)

@@ -36,9 +36,7 @@ def members_of(variants: list[str]) -> list[str]:
 
 CANDS = make_candidates()
 rows, TUNED = [], {}
-for name, vs in CANDS.items():
-    if not BUDGET.ok(300):
-        print("Orçamento de tempo: candidatos restantes ignorados."); break
+for name, vs in CANDS.items():          # sem verificação de tempo: o orçamento reserva tempo para esta fase (numa corrida, cortá-la deitou fora 7 h de SSL)
     per_tta, best_tta = {}, (-1.0, None)
     for tta in CFG["tta_candidates"]:
         sc = dev_score(cand_probs(vs, tta))

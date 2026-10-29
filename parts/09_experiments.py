@@ -71,10 +71,15 @@ if CFG["do_cv"]:
     for seed in CFG["seeds"]:
         for arch in CFG["archs"]:
             for fold in range(CFG["cv_folds"]):
+                ep = CFG["cv_epochs"].get(arch, CFG["epochs"])
+                old = next((r for r in REUSED_RUNS if r["spec"]["exp"] == "cv" and reusable(r, arch=arch, seed=seed, fold=fold, n_folds=CFG["cv_folds"], epochs=ep)), None)
+                if old is not None:
+                    print(f"[reaproveitado] {arch} seed {seed} fold {fold}: {old['run_id']}")
+                    SUP.append(old)
+                    continue
                 if not BUDGET.ok(900):
                     print(f"Orçamento de tempo quase esgotado: a parar (último: {arch} fold {fold}).")
                     break
-                ep = CFG["cv_epochs"].get(arch, CFG["epochs"])
                 SUP.append(train_run(default_spec(exp="cv", arch=arch, seed=seed, fold=fold, n_folds=CFG["cv_folds"], selection="last", epochs=ep, patience=ep)))
 else:
     for seed in CFG["seeds"]:           # sementes no ciclo exterior: se o tempo acabar, todas as arquiteturas têm pelo menos a 1.ª semente

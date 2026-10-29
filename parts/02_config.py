@@ -39,7 +39,7 @@ _BASE = dict(
     ssl_ens_gens=1,         # gerações: g=2 usa como professor o ensemble {supervisionados + alunos da geração 1} do mesmo fold; o aluno parte sempre do supervisionado
     # inferência / estatística
     tta_candidates=["none", "flip", "flip_ms"], pp_min_area_fracs=[0.0, 0.0005, 0.001, 0.002, 0.005],
-    pp_fibrin_fracs=[0.0, 0.001, 0.002, 0.005, 0.01], pp_scale_grid=[0.6, 0.8, 1.0, 1.25, 1.6], tune_class_scale=True, pp_gain_margin=0.002, pp_fibrin_conf=[0.0, 0.5, 0.6, 0.7, 0.8], deterministic=True,
+    pp_fibrin_fracs=[0.0, 0.001, 0.002, 0.005, 0.01], pp_scale_grid=[0.6, 0.8, 1.0, 1.25, 1.6], tune_class_scale=True, pp_gain_margin=0.002, pp_fibrin_conf=[0.0, 0.5, 0.6, 0.7, 0.8], deterministic=False,   # True torna o treino 2,5-4x mais lento em T4 (medido); a variação entre corridas veio do PID na semente (corrigido), não dos kernels CUDA
     bootstrap_b=2000, paired_bootstrap_b=1000, time_budget_hours=9.0, resume=True, seed_base=42,
 )
 _MODES = {
@@ -100,7 +100,8 @@ class _Budget:
         return self.left() > need_s
 
 
-BUDGET = _Budget(CFG["time_budget_hours"])
+FINAL_STAGE_RESERVE_H = 0.75      # tempo reservado para a fase final (candidatos, TTA, teste, exportação): o treino pára antes, a fase final NUNCA é cortada por tempo
+BUDGET = _Budget(max(CFG["time_budget_hours"] - FINAL_STAGE_RESERVE_H, 0.1))
 
 
 def seed_everything(seed: int) -> None:

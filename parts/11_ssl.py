@@ -389,11 +389,17 @@ if CFG["do_ssl"] and CFG["ssl_ens"] and len(UNL) > 0 and BUDGET.ok(1800):
         for arch in ens_archs:
             new = []
             for rid in VARIANTS[f"sup:{arch}"]:
-                if not BUDGET.ok(900):
-                    break
                 run = POOL[rid]["run"]
-                pl = fold_pseudo_labels(run["spec"].get("fold"), items_e, gen)
-                r = train_ssl_ens_round(run, items_e, pl, gen)      # o aluno parte SEMPRE do modelo supervisionado do fold (evita acumular erros entre gerações)
+                old = next((r for r in REUSED_RUNS if r["spec"]["exp"] == ens_kind(gen) and reusable(r, arch=arch, seed=run["spec"]["seed"], fold=run["spec"].get("fold"),
+                                                                                                     n_folds=run["spec"].get("n_folds"), epochs=CFG["ssl_epochs"])), None)
+                if old is not None:
+                    print(f"[reaproveitado] ssl geração {gen} {arch} seed {run['spec']['seed']} fold {run['spec'].get('fold')}: {old['run_id']}")
+                    r = old
+                else:
+                    if not BUDGET.ok(900):
+                        break
+                    pl = fold_pseudo_labels(run["spec"].get("fold"), items_e, gen)
+                    r = train_ssl_ens_round(run, items_e, pl, gen)      # o aluno parte SEMPRE do modelo supervisionado do fold (evita acumular erros entre gerações)
                 new.append(r)
                 SSL_RESULTS.append(r)
                 register_member(r, ens_kind(gen))

@@ -52,3 +52,14 @@ semente, o OOF de uma arquitetura variou ~1 pp entre corridas — por isso difer
 ## Versões
 
 O notebook fixa `segmentation-models-pytorch >=0.5.0,<0.6.0` (versão em que foi validado). Na 3.ª corrida o Kaggle instalou a 0.6.0 sem aviso e isso era uma variável a mais ao comparar corridas.
+
+## Recuperar uma corrida (reaproveitar modelos já treinados)
+
+Se uma corrida terminou o treino mas a fase final falhou ou foi cortada, **não é preciso treinar de novo**: abra o notebook, em *Add Input* anexe a **saída da corrida anterior**
+(a versão guardada do notebook, que contém `dfu_run_full/runs/`) e execute. O notebook encontra os `result.json`/`best.pt` compatíveis (mesmo *frame*, tela, nº de folds, épocas, arquitetura,
+semente e fold), imprime `[reaproveitado] …` para cada um, treina só o que faltar e refaz a seleção, o teste e a exportação (~25 min). Alternativamente, defina `DFU_REUSE_RUNS` com o caminho da pasta `runs/`.
+
+## Orçamento de tempo
+
+O treino pára `FINAL_STAGE_RESERVE_H` (0,75 h) antes do limite `time_budget_hours`, e a fase final (candidatos, TTA, teste, exportação) **não tem verificação de tempo**. Numa corrida em que o treino
+consumiu todo o orçamento, a fase final avaliou só 2 candidatos e deitou fora ~7 h de SSL; isto já não pode acontecer. `deterministic` passou a `False` por omissão: tornava o treino 2,5–4× mais lento em T4.
