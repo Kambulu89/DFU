@@ -218,6 +218,8 @@ def split_for(spec: dict) -> tuple[list[dict], list[dict]]:
     recs = get_frame(spec["frame"])
     if spec.get("fold") is None:
         return recs["train"], recs["val"]
+    if spec["fold"] == "all":            # re-treino final em 100 % do desenvolvimento (94 imagens; o teste nunca entra): sem imagens retidas
+        return recs["train"] + recs["val"], []
     fm = fold_assignment(spec["n_folds"], CFG["cv_seed"])
     dev = recs["train"] + recs["val"]
     return [r for r in dev if fm[r["name"]] != spec["fold"]], [r for r in dev if fm[r["name"]] == spec["fold"]]
@@ -253,7 +255,8 @@ def _train_run(spec: dict, micro_bs_hint: int | None = None) -> dict:
     S = spec["size"]
     tr_recs, va_recs = split_for(spec)
     train_set = SegSet(tr_recs, S, aug=spec["aug"])
-    val_items = EvalItems(va_recs, S)
+    val_items = EvalItems(va_recs, S) if va_recs else None      # None no re-treino em 100 % (sem validação: épocas fixas, EMA final)
+    assert val_items is not None or spec.get("selection") == "last", "Sem validação só é possível com selection='last'"
     loader = make_train_loader(train_set, spec["batch_size"], CFG["fibrin_boost"] if spec["sampler"] else 0.0, spec["seed"])
     model, prov = build_model(spec["arch"], spec["pretrained"])
     model.to(DEVICE)
@@ -311,10 +314,12 @@ def _train_run(spec: dict, micro_bs_hint: int | None = None) -> dict:
             torch.nn.utils.clip_grad_norm_(model.parameters(), CFG["grad_clip"])
             scaler.step(opt); scaler.update(); sched.step(); ema.update(model)
             run_loss, nb = run_loss + loss_tot, nb + 1
-        res, _ = evaluate_models([ema.module], val_items, "none")
-        vm = res.metrics()
+        if val_items is not None:
+            vm = evaluate_models([ema.module], val_items, "none")[0].metrics()
+        else:
+            vm = {k: float("nan") for k in ("macro_fg_dice", "micro_fg_dice", "macro_fg_iou", "paper_dice", "dice_fibrin", "dice_granulation", "dice_callus")}
         score = 0.0 if np.isnan(vm["macro_fg_dice"]) else vm["macro_fg_dice"]
-        hist.append(dict(epoch=epoch, train_loss=run_loss / max(nb, 1), val_loss=canvas_loss(ema.module, val_items, criterion),
+        hist.append(dict(epoch=epoch, train_loss=run_loss / max(nb, 1), val_loss=canvas_loss(ema.module, val_items, criterion) if val_items is not None else float("nan"),
                          val_macro_fg_dice=vm["macro_fg_dice"], val_micro_fg_dice=vm["micro_fg_dice"], val_macro_fg_iou=vm["macro_fg_iou"],
                          val_paper_dice=vm["paper_dice"], val_dice_fibrin=vm["dice_fibrin"], val_dice_granulation=vm["dice_granulation"],
                          val_dice_callus=vm["dice_callus"], lr_dec=opt.param_groups[1]["lr"]))
@@ -340,8 +345,8 @@ def _train_run(spec: dict, micro_bs_hint: int | None = None) -> dict:
     # reavalia o MELHOR checkpoint (ou o último, se selection='last') carregado de disco (fp16->fp32), para que o resultado seja o do artefacto guardado
     final = Net(ARCH_SPECS[spec["arch"]]["ctor"](None)).to(DEVICE)
     final.load_state_dict(_load_half(rdir / "best.pt"))
-    res, _ = evaluate_models([final], val_items, "none")
-    result = dict(spec=spec, run_id=rid, status=status, best_epoch=best_epoch, epochs_run=len(hist), val=res.metrics(), val_names=[r["name"] for r in va_recs], history=hist, provenance=prov,
+    val_final = evaluate_models([final], val_items, "none")[0].metrics() if val_items is not None else {}
+    result = dict(spec=spec, run_id=rid, status=status, best_epoch=best_epoch, epochs_run=len(hist), val=val_final, val_names=[r["name"] for r in va_recs], history=hist, provenance=prov,
                   params_M=round(count_params(model), 2), micro_batch=micro_bs, train_seconds=round(time.time() - t0, 1), ckpt=str(rdir / "best.pt"),
                   device=HW["gpu_name"] or "cpu")
     (rdir / "result.json").write_text(json.dumps(result, indent=1, default=float))

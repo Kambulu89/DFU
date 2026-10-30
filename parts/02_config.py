@@ -37,7 +37,9 @@ _BASE = dict(
     ssl_ens=False,          # SSL com professor ENSEMBLE limpo por fold (pseudo-labels offline do ensemble de todas as arquiteturas do mesmo fold, que não viram as imagens retidas)
     ssl_ens_tta="flip",
     ssl_ens_gens=1,         # gerações: g=2 usa como professor o ensemble {supervisionados + alunos da geração 1} do mesmo fold; o aluno parte sempre do supervisionado
+    refit_all=False, refit_seeds=[42],   # re-treino em 100 % do desenvolvimento depois da CV (só com do_cv); entra só no ensemble aplicado ao teste
     # inferência / estatística
+    objective="combo",      # critério das decisões no desenvolvimento (TTA, candidato, pós-proc.): 'macro' | 'paper' (Dice global do artigo) | 'combo' (média dos dois)
     tta_candidates=["none", "flip", "flip_ms"], pp_min_area_fracs=[0.0, 0.0005, 0.001, 0.002, 0.005],
     pp_fibrin_fracs=[0.0, 0.001, 0.002, 0.005, 0.01], pp_scale_grid=[0.6, 0.8, 1.0, 1.25, 1.6], tune_class_scale=True, pp_gain_margin=0.002, pp_fibrin_conf=[0.0, 0.5, 0.6, 0.7, 0.8], deterministic=False,   # True torna o treino 2,5-4x mais lento em T4 (medido); a variação entre corridas veio do PID na semente (corrigido), não dos kernels CUDA
     bootstrap_b=2000, paired_bootstrap_b=1000, time_budget_hours=9.0, resume=True, seed_base=42,
@@ -45,7 +47,7 @@ _BASE = dict(
 _MODES = {
     "smoke": dict(archs=["smoke_fpn_r18"], seeds=[0], epochs=3, patience=3, warmup_epochs=1, freeze_epochs=1, batch_size=8,
                   ssl_rounds=1, ssl_epochs=2, ssl_steps_per_epoch=3, bootstrap_b=100, paired_bootstrap_b=50, do_lr_range=True, num_workers=0,
-                  do_cv=True, cv_folds=2, ssl_select="last", pp_scale_grid=[0.8, 1.0, 1.25], ssl_ens=True, ssl_ens_gens=2,
+                  do_cv=True, cv_folds=2, ssl_select="last", pp_scale_grid=[0.8, 1.0, 1.25], ssl_ens=True, ssl_ens_gens=2, refit_all=True, refit_seeds=[0],
                   do_probes=True, probe_epochs=1, probe_frames=[("padded", 256), ("roi", 256)],
                   probe_losses=["ce_dice", "focal_tversky"], do_ablation=True, ablation_epochs=1, time_budget_hours=2.0),
     "quick": dict(archs=["unetpp_effb4", "segformer_mitb3"], seeds=[42], epochs=60, patience=20, ssl_rounds=1, ssl_epochs=30,
@@ -56,7 +58,8 @@ _MODES = {
     # o Dice do SSL estabiliza por volta da época 10 -> 20 épocas bastam. 2.ª corrida: a geração 2 do professor ensemble não acrescentou nada (Δ≈0, indistinguível) e custou 175 min ->
     # volta a 1 geração, e o tempo vai para uma 2.ª semente (mais membros no ensemble; o OOF faz a média dos membros que não viram cada imagem).
     "full": dict(archs=["upernet_convnext_s", "segformer_mitb3"], seeds=[42, 43], size=384, do_probes=False, do_ablation=False, do_cv=True,
-                 ssl_select="last", ssl_archs_top=2, ssl_ema=False, ssl_ens=True, ssl_ens_gens=1, ssl_epochs=20, time_budget_hours=10.5),
+                 ssl_select="last", ssl_archs_top=2, ssl_ema=False, ssl_ens=True, ssl_ens_gens=1, ssl_epochs=20, refit_all=True, refit_seeds=[42, 43, 44],
+                 time_budget_hours=10.5),
 }
 assert MODE in _MODES, f"MODE inválido: {MODE}"
 if MODE != "full":

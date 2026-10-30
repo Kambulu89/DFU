@@ -21,7 +21,7 @@ PROBE_MARGIN = 0.005
 
 
 def val_score(r: dict) -> float:
-    v = r["val"]["macro_fg_dice"]
+    v = (r.get("val") or {}).get("macro_fg_dice")       # modelos re-treinados em 100 % não têm validação
     return -1.0 if v is None or np.isnan(v) else v
 
 

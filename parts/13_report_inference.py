@@ -169,7 +169,7 @@ for rid in FINAL["members"]:
 pd.DataFrame([dict(label=l, **r["metrics"]) for l, r in TEST_ROWS.items()]).to_csv(DIRS["tables"] / "test_metrics_all_definitions.csv", index=False)
 all_hist = [dict(run_id=r["run_id"], **h) for r in ALL_RESULTS for h in r["history"]]
 pd.DataFrame(all_hist).to_csv(DIRS["tables"] / "training_history_all_runs.csv", index=False)
-runs_table([r for r in ALL_RESULTS if "val" in r]).to_csv(DIRS["tables"] / "all_runs_val.csv", index=False)
+runs_table([r for r in ALL_RESULTS if r.get("val")]).to_csv(DIRS["tables"] / "all_runs_val.csv", index=False)
 (DIRS["tables"] / "paper_reported_constants.json").write_text(json.dumps(PAPER, indent=1))
 
 def md_table(df: pd.DataFrame) -> str:

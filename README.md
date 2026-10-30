@@ -7,6 +7,7 @@ Este diretório é de investigação e é independente da plataforma de gestão 
 |---|---|
 | `dfu_tissue_segmentation.ipynb` | **Notebook a carregar no Kaggle** (53 células; sem saídas — são geradas ao executar) |
 | `parts/*.py` | Fonte do notebook (formato percent, uma secção por ficheiro). Edite aqui e regenere |
+| `RESULTS.md` | Resumo honesto das corridas `full` (média ± desvio entre corridas, comparação com o artigo) |
 | `build_notebook.py` | `python build_notebook.py` regenera o `.ipynb` (precisa de `nbformat`); `--flat x.py` gera um script plano para testes |
 
 ## Estado de verificação (honesto)

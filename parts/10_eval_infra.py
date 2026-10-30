@@ -59,8 +59,11 @@ _MEMBER_PROBS: dict[tuple, dict[str, np.ndarray]] = {}
 def member_probs(rid: str, tta: str) -> dict[str, np.ndarray]:
     """Probabilidades do membro nas imagens que ele NÃO viu no treino (dentro do conjunto de avaliação): {nome: (K,h,w)}."""
     if (rid, tta) not in _MEMBER_PROBS:
+        held = set(POOL[rid]["val_names"]) & set(EVAL_INDEX)
+        if not held:                     # modelo re-treinado em 100 % do desenvolvimento: não tem previsões fora de amostra (só entra no teste)
+            _MEMBER_PROBS[(rid, tta)] = {}
+            return _MEMBER_PROBS[(rid, tta)]
         if rid not in _MEMBER_ITEMS:
-            held = set(POOL[rid]["val_names"])
             _MEMBER_ITEMS[rid] = EvalItems([r for r in EVAL_RECS if r["name"] in held], SIZE)
         items = _MEMBER_ITEMS[rid]
         pr = predict_probs([load_pool_model(rid)], items, tta)
@@ -102,9 +105,16 @@ def eval_dev(probs: list[np.ndarray], pp=0.0, idx=None) -> EvalResult:
     return evaluate_preds([EVAL_ITEMS.names[i] for i in idx], [EVAL_ITEMS.gts[i] for i in idx], probs_to_preds([probs[i] for i in idx], pp))
 
 
+def objective(m: dict) -> float:
+    """Critério de decisão no desenvolvimento (TTA, candidato, pós-processamento), fixado ANTES de ver o teste (`CFG['objective']`):
+    'macro' = macro-Dice dos tecidos; 'paper' = Dice global (réplica do protocolo do artigo); 'combo' = média dos dois (equilibra as métricas por tecido e a global do artigo)."""
+    a, b = m["macro_fg_dice"], m["paper_dice"]
+    a, b = (0.0 if a is None or np.isnan(a) else a), (0.0 if b is None or np.isnan(b) else b)
+    return {"macro": a, "paper": b, "combo": 0.5 * (a + b)}[CFG["objective"]]
+
+
 def dev_score(probs, pp=0.0, idx=None) -> float:
-    v = eval_dev(probs, pp, idx).metrics(light=True)["macro_fg_dice"]
-    return 0.0 if np.isnan(v) else v
+    return objective(eval_dev(probs, pp, idx).metrics(light=True))
 
 
 def tune_postproc(probs: list[np.ndarray], idx=None) -> tuple[dict, float, float]:

@@ -265,17 +265,27 @@ def fold_pseudo_labels(fold, items: list[dict], gen: int = 1) -> _Packed:
     Todos eles treinaram sem as imagens retidas do fold, logo o OOF não tem fuga."""
     if (fold, gen) in _PL_CACHE:
         return _PL_CACHE[(fold, gen)]
-    kinds = {"sup"} | {ens_kind(g) for g in range(1, gen)}
-    teachers = [rid for rid, e in POOL.items() if e["kind"] in kinds and e["fold"] == fold]
+    if fold == "all":     # re-treino em 100 %: sem OOF a proteger -> professor = TODOS os modelos supervisionados e alunos SSL (CV + re-treino), sem TTA (custo)
+        teachers = [rid for rid, e in POOL.items() if e["kind"] in {"sup", "ssle"}]
+        tta = "none"
+    else:
+        kinds = {"sup"} | {ens_kind(g) for g in range(1, gen)}
+        teachers = [rid for rid, e in POOL.items() if e["kind"] in kinds and e["fold"] == fold]
+        tta = CFG["ssl_ens_tta"]
     assert teachers, f"Sem modelos professores para o fold {fold}"
-    models = [load_pool_model(r) for r in teachers]
-    pl_all, conf_all = [], []
-    for i in range(0, len(items), 8):
-        x = torch.stack([to_tensor01(it["img"]) for it in items[i:i + 8]]).to(DEVICE)
-        p = sum(canvas_probs(m, x, CFG["ssl_ens_tta"]) for m in models) / len(models)
-        conf, pl = p.max(1)
-        pl_all.append(pl.to(torch.uint8).cpu()); conf_all.append(conf.half().cpu())
-    pl, conf = torch.cat(pl_all).numpy(), torch.cat(conf_all).numpy().astype(np.float32)
+    # modelo a modelo (só um na GPU de cada vez), acumulando probabilidades em CPU: seguro em memória para qualquer nº de professores
+    acc = None
+    for rid in teachers:
+        m = load_pool_model(rid)
+        for i in range(0, len(items), 8):
+            x = torch.stack([to_tensor01(it["img"]) for it in items[i:i + 8]]).to(DEVICE)
+            p = canvas_probs(m, x, tta).cpu()
+            if acc is None:
+                acc = torch.zeros((len(items),) + tuple(p.shape[1:]), dtype=torch.float32)
+            acc[i:i + len(p)] += p
+    conf_t, pl_t = (acc / len(teachers)).max(1)
+    pl, conf = pl_t.to(torch.uint8).numpy(), conf_t.numpy().astype(np.float32)
+    del acc
     tau = np.zeros(K)
     rng = np.random.default_rng(0)
     for c in range(K):
@@ -308,7 +318,7 @@ def train_ssl_ens_round(sup_run: dict, items: list[dict], pl: _Packed, gen: int 
     tr_recs, va_recs = split_for(spec)
     lab_set = SegSet(tr_recs, S, aug="standard")
     unl_set = CanvasSegSet([dict(img=it["img"], mask=pl.packed[j], valid=it["valid"]) for j, it in enumerate(items)], aug="weak")
-    val_items = EvalItems(va_recs, S)
+    val_items = EvalItems(va_recs, S) if va_recs else None      # None no re-treino em 100 % do desenvolvimento
     nw = CFG["num_workers"]
     mk = lambda ds, sampler: torch.utils.data.DataLoader(ds, batch_size=bs, sampler=sampler, num_workers=nw, drop_last=True, worker_init_fn=worker_init,  # noqa: E731
                                                           pin_memory=DEVICE.type == "cuda", persistent_workers=nw > 0)
@@ -328,7 +338,8 @@ def train_ssl_ens_round(sup_run: dict, items: list[dict], pl: _Packed, gen: int 
     total = spec["epochs"] * spec["ssl_steps"]
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda st: lr_factor(st, int(0.05 * total), total, 0.05))
     scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
-    base = evaluate_models([ema.module], val_items, "none")[0].metrics()
+    _nan = {k: float("nan") for k in ("macro_fg_dice", "micro_fg_dice", "dice_fibrin", "dice_granulation", "dice_callus", "macro_fg_iou", "paper_dice")}
+    base = evaluate_models([ema.module], val_items, "none")[0].metrics() if val_items is not None else dict(_nan)
     hist, t0, step = [], time.time(), 0
     lsup = lunl = 0.0
     for epoch in range(spec["epochs"]):
@@ -360,7 +371,7 @@ def train_ssl_ens_round(sup_run: dict, items: list[dict], pl: _Packed, gen: int 
             torch.nn.utils.clip_grad_norm_(student.parameters(), CFG["grad_clip"])
             scaler.step(opt); scaler.update(); sched.step(); ema.update(student)
             step += 1
-        vm = evaluate_models([ema.module], val_items, "none")[0].metrics()
+        vm = evaluate_models([ema.module], val_items, "none")[0].metrics() if val_items is not None else _nan
         hist.append(dict(epoch=epoch, loss_sup=lsup / spec["ssl_steps"], loss_unl=lunl / spec["ssl_steps"], val_macro_fg_dice=vm["macro_fg_dice"], val_micro_fg_dice=vm["micro_fg_dice"],
                          val_dice_fibrin=vm["dice_fibrin"], val_dice_granulation=vm["dice_granulation"], val_dice_callus=vm["dice_callus"], val_macro_fg_iou=vm["macro_fg_iou"],
                          val_paper_dice=vm["paper_dice"], w_u=w_u))
@@ -368,9 +379,9 @@ def train_ssl_ens_round(sup_run: dict, items: list[dict], pl: _Packed, gen: int 
     _save_half(ema.module.state_dict(), rdir / "best.pt")       # sem seleção de época: EMA final
     final = Net(ARCH_SPECS[spec["arch"]]["ctor"](None)).to(DEVICE)
     final.load_state_dict(_load_half(rdir / "best.pt"))
-    vfin = evaluate_models([final], val_items, "none")[0].metrics()
+    vfin = evaluate_models([final], val_items, "none")[0].metrics() if val_items is not None else {}
     result = dict(spec=spec, run_id=rid, status="finished", best_epoch=len(hist) - 1, epochs_run=len(hist), val=vfin, val_names=[r["name"] for r in va_recs], val_before=base,
-                  improved=(vfin["macro_fg_dice"] or 0) > (base["macro_fg_dice"] or 0) + 1e-4, history=hist, provenance=prov, params_M=round(count_params(student), 2), micro_batch=micro,
+                  improved=bool(vfin) and (vfin["macro_fg_dice"] or 0) > (base["macro_fg_dice"] or 0) + 1e-4, history=hist, provenance=prov, params_M=round(count_params(student), 2), micro_batch=micro,
                   train_seconds=round(time.time() - t0, 1), ckpt=str(rdir / "best.pt"), device=HW["gpu_name"] or "cpu",
                   pseudo_label_stats=dict(tau=pl.tau.tolist(), kept=pl.kept.tolist(), share=pl.share.tolist(), n_teachers=pl.n_teachers))
     rf.write_text(json.dumps(result, indent=1, default=float))
@@ -472,6 +483,53 @@ if SSL_VARIANTS:
     display(SSL_PAIRED)
 else:
     print("Sem variantes SSL completas: nada a comparar.")
+
+# %% [markdown]
+# ### 16c. Re-treino em 100 % do desenvolvimento (`refit_all`)
+# A validação cruzada serviu para **escolher a receita** (arquiteturas, épocas fixas, SSL, TTA) e medi-la fora de amostra. Cada modelo da CV treinou em ~75 das 94 imagens de desenvolvimento;
+# como a receita usa épocas fixas e o EMA final (sem *early stopping*), pode treinar-se **sem validação** em todas as 94 (+25 % de dados por modelo) — prática padrão depois da seleção.
+# Estes modelos **não têm previsões fora de amostra**: não entram nas decisões do desenvolvimento (TTA, candidato, pós-processamento), só se juntam aos membros da CV das mesmas variantes no
+# *ensemble* aplicado ao **teste**. Para o aluno SSL o professor é o *ensemble* de todos os modelos (CV + re-treino). O teste continua a não ser usado em nenhuma decisão.
+
+# %%
+REFIT_RESULTS: list[dict] = []
+if CFG["do_cv"] and CFG.get("refit_all") and BUDGET.ok(1800):
+    for seed in CFG["refit_seeds"]:
+        for arch in CFG["archs"]:
+            if f"sup:{arch}" not in SUP_VARIANTS:
+                continue
+            ep = CFG["cv_epochs"].get(arch, CFG["epochs"])
+            old = next((r for r in REUSED_RUNS if r["spec"]["exp"] == "refit" and reusable(r, arch=arch, seed=seed, fold="all", epochs=ep)), None)
+            if old is None and not BUDGET.ok(900):
+                print("Orçamento de tempo: re-treino interrompido."); break
+            r = old or train_run(default_spec(exp="refit", arch=arch, seed=seed, fold="all", selection="last", epochs=ep, patience=ep))
+            if old is not None:
+                print(f"[reaproveitado] re-treino {arch} seed {seed}: {old['run_id']}")
+            REFIT_RESULTS.append(r)
+            register_member(r, "sup")
+    if CFG["do_ssl"] and CFG["ssl_ens"] and len(UNL) > 0:
+        ssl_archs_refit = [v.split(":", 1)[1] for v in VARIANTS if v.startswith("ssle:")]
+        refit_sup = [r for r in REFIT_RESULTS if r["spec"]["arch"] in ssl_archs_refit]
+        if refit_sup:
+            if "items_e" not in globals():
+                items_e = _unlabeled_canvas_items(load_unlabeled_records(CFG["frame"]), SIZE)
+            for rs in refit_sup:
+                old = next((r for r in REUSED_RUNS if r["spec"]["exp"] == "ssle" and reusable(r, arch=rs["spec"]["arch"], seed=rs["spec"]["seed"], fold="all", epochs=CFG["ssl_epochs"])), None)
+                if old is None and not BUDGET.ok(900):
+                    print("Orçamento de tempo: SSL do re-treino interrompido."); break
+                if old is None:
+                    r = train_ssl_ens_round(rs, items_e, fold_pseudo_labels("all", items_e, 1), 1)
+                else:
+                    r = old
+                    print(f"[reaproveitado] SSL re-treino {rs['spec']['arch']} seed {rs['spec']['seed']}: {old['run_id']}")
+                REFIT_RESULTS.append(r)
+                register_member(r, "ssle")
+    ALL_RESULTS += REFIT_RESULTS
+    print(f"Re-treino em 100 % do desenvolvimento: {len(REFIT_RESULTS)} modelos (entram só no ensemble aplicado ao teste; não afetam as decisões OOF):")
+    for r in REFIT_RESULTS:
+        print(f"  {r['spec']['exp']:6s} {r['spec']['arch']:20s} seed {r['spec']['seed']} | {r['epochs_run']} épocas | {r['train_seconds'] / 60:.1f} min")
+else:
+    print("Re-treino em 100 % desligado (`refit_all=False`) ou sem validação cruzada.")
 
 # %% [markdown]
 # ## 14b. Ablação (Experiência E) — indicativa

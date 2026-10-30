@@ -47,11 +47,11 @@ for name, vs in CANDS.items():          # sem verificação de tempo: o orçamen
     pr = cand_probs(vs, tta)
     res = eval_dev(pr, 0.0).metrics()
     TUNED[name] = dict(variants=vs, members=members_of(vs), tta=tta, pp=norm_pp(None), dev=res, dev_raw=per_tta["none"])
-    rows.append(dict(candidato=name, n_modelos=len(TUNED[name]["members"]), tta=tta, dev_macro_fg_sem_tta=per_tta["none"], dev_macro_fg=res["macro_fg_dice"], dev_micro_fg=res["micro_fg_dice"],
+    rows.append(dict(candidato=name, n_modelos=len(TUNED[name]["members"]), tta=tta, dev_objetivo_sem_tta=per_tta["none"], dev_objetivo=objective(res), dev_macro_fg=res["macro_fg_dice"], dev_micro_fg=res["micro_fg_dice"],
                      dev_paper_dice=res["paper_dice"], dev_fibrin=res["dice_fibrin"], dev_granulation=res["dice_granulation"], dev_callus=res["dice_callus"]))
-CAND_TABLE = pd.DataFrame(rows).sort_values(["dev_macro_fg", "n_modelos"], ascending=[False, True]).reset_index(drop=True)
+CAND_TABLE = pd.DataFrame(rows).sort_values(["dev_objetivo", "n_modelos"], ascending=[False, True]).reset_index(drop=True)
 CAND_TABLE.to_csv(DIRS["tables"] / "candidates_dev.csv", index=False)
-print(f"Candidatos ({'OOF, 94 imagens' if CFG['do_cv'] else 'validação oficial, 16 imagens'}; a seleção usa só estas colunas — o teste não foi lido):")
+print(f"Objetivo das decisões: {CFG['objective']} (macro = macro-Dice dos tecidos; paper = Dice global do artigo; combo = média). Candidatos ({'OOF, 94 imagens' if CFG['do_cv'] else 'validação oficial, 16 imagens'}; a seleção usa só estas colunas — o teste não foi lido):")
 display(CAND_TABLE.round(4))
 FINAL_NAME = CAND_TABLE.candidato.iloc[0]
 FINAL = TUNED[FINAL_NAME]
